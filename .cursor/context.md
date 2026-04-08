@@ -150,6 +150,10 @@ The original circuit had NO pull-up resistor. The 357919149 Hall sensor has an o
 - Do NOT skip `del sdkconfig` when changing sdkconfig.defaults
 - Do NOT put the pull-up resistor AFTER the 4.7k series resistor (voltage divider issue)
 
+## AI Assistant
+- **Model**: Claude (Anthropic) — used via Cursor IDE
+- **Chat continuity**: On a new PC/chat, say "read `.cursor/context.md` and continue from where we left off"
+
 ## VW T4 1.9TD Specific Info
 - Speed sensor: 357919149 (3-pin Hall effect, open-collector)
   - Pin 1: 12V power from fuse 15 (ignition-switched)
