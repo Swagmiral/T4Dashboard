@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "../../Software/lv_port_pc_visual_studio-release-v9.4-legacy-vs-solution"
+		},
+		{
+			"path": "EEZ_T4Dashboard/src/ui"
+		}
+	],
+	"settings": {}
+}

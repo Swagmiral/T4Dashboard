@@ -1,0 +1,82 @@
+# =============================================================================
+# T4 Dashboard - Fast Boot Configuration
+# =============================================================================
+
+# --- Target ---
+CONFIG_IDF_TARGET="esp32s3"
+
+# --- Flash ---
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# --- Bootloader (FAST BOOT) ---
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
+CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=y
+CONFIG_BOOTLOADER_SKIP_VALIDATE_ON_POWER_ON=y
+CONFIG_BOOTLOADER_WDT_ENABLE=n
+CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_PERF=y
+
+# --- Brownout (level 3 ≈ 2.6V; level 7 default is too sensitive for PSRAM+LCD inrush) ---
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_3=y
+
+# --- App Log Level (WARN = matches original working config) ---
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
+
+# --- CPU ---
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# --- Chip revision (ESP32-S3 v0.2+ only) ---
+# CONFIG_ESP32S3_REV_MIN_0 is not set
+# CONFIG_ESP32S3_REV_MIN_1 is not set
+CONFIG_ESP32S3_REV_MIN_2=y
+
+# --- PSRAM (match Waveshare config) ---
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# --- Bluetooth DISABLED ---
+CONFIG_BT_ENABLED=n
+
+# --- WiFi (SoftAP config page) ---
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+CONFIG_ESP_WIFI_NAN_ENABLE=n
+
+# --- HTTP Server ---
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# --- FreeRTOS ---
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_UNICORE=n
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# --- Heap ---
+CONFIG_HEAP_POISONING_DISABLED=y
+
+# --- NVS ---
+CONFIG_NVS_ENCRYPTION=n
+
+# --- Watchdog ---
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# --- Compiler ---
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# --- Partition Table ---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# --- LVGL (EEZ main screen uses Montserrat 14 on one label) ---
+CONFIG_LV_FONT_MONTSERRAT_14=y
+# Helium SW blend + PSRAM direct FB can corrupt fine A8 text; use portable C blend
+# CONFIG_LV_USE_NATIVE_HELIUM_ASM is not set
