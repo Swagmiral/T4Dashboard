@@ -151,7 +151,7 @@ The original circuit had NO pull-up resistor. The 357919149 Hall sensor has an o
 - Do NOT put the pull-up resistor AFTER the 4.7k series resistor (voltage divider issue)
 
 ## AI Assistant
-- **Model**: Claude (Anthropic) — used via Cursor IDE
+- **Model**: Claude Opus 4.6 (Anthropic) — used via Cursor IDE
 - **Chat continuity**: On a new PC/chat, say "read `.cursor/context.md` and continue from where we left off"
 
 ## VW T4 1.9TD Specific Info
