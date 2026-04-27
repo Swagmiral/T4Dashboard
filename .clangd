@@ -1,0 +1,13 @@
+CompileFlags:
+  CompilationDatabase: build/
+  Remove: [-fzero-init-padding-bits=all, -fno-malloc-dce, -fstrict-volatile-bitfields, -fno-tree-switch-conversion, -mdisable-hardware-atomics, -mlongcalls]
+  Add:
+    - -isystem
+    - C:/Espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/lib/gcc/xtensa-esp-elf/15.2.0/include
+    - -isystem
+    - C:/Espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/lib/gcc/xtensa-esp-elf/15.2.0/include-fixed
+    - -isystem
+    - C:/Espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/xtensa-esp-elf/include
+
+Diagnostics:
+  UnusedIncludes: None

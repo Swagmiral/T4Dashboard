@@ -15,6 +15,12 @@ void dashboard_init(void);
 void dashboard_set_speed(uint16_t kmh);
 void dashboard_set_rpm(uint16_t rpm);
 void dashboard_set_fuel(uint8_t percent);
+/** Show last saved fuel % immediately at boot (before ADC smoothing). */
+void dashboard_restore_fuel_from_nvs(uint8_t pct);
+/** No valid fuel sensor: "---", reset smoother, neutral styling (NVS cleared by caller). */
+void dashboard_fuel_invalidate_reading(void);
+/** 0–100 for NVS persist, or 255 if nothing sensible to save yet. */
+uint8_t dashboard_get_fuel_persist_pct(void);
 void dashboard_feed_fuel(uint8_t raw_pct, uint16_t speed);
 void dashboard_feed_temp(uint8_t raw_pct);
 void dashboard_set_temp_ok(bool ok);
@@ -22,6 +28,7 @@ void dashboard_set_temp(int8_t celsius);
 void dashboard_set_temp_level(uint8_t percent);  // COLD/OK/HOT with moving label
 void dashboard_set_voltage_valid(bool valid, float volts);
 void dashboard_feed_voltage(bool valid, float raw_volts);
+void dashboard_set_sensor_error(uint8_t channel, bool error);
 void dashboard_set_odometer(uint32_t km);
 
 // Indicators

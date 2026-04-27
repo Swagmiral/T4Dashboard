@@ -1,7 +1,7 @@
 /**
  * NVS HAL — Dashboard config + Odometer storage
  *
- * Config:  single CRC-protected blob, versioned for migration
+ * Config:  JSON blob (merge on load) + optional one-time migration from legacy CRC blob
  * Odometer: wear-leveled rotating slots with CRC
  *
  * Both survive normal idf.py flash (only erase-flash wipes NVS).
@@ -9,17 +9,21 @@
 
 #include "hal_nvs.h"
 #include "config.h"
+#include "config_json.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_crc.h"
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "nvs";
 
 #define NS_ODOMETER   "odometer"
 #define NS_CONFIG     "config"
-#define CONFIG_KEY    "cfg"
+#define CONFIG_KEY    "cfg"       /* legacy CRC blob */
+#define CFG_JSON_KEY  "cfg_json"  /* merge-friendly JSON (no odometer) */
+#define FUEL_LAST_PCT_KEY "fuel_last"
 
 // ============================================================================
 // Global config instance
@@ -53,8 +57,6 @@ void config_set_defaults(dashboard_config_t *cfg)
     // VW T4 fuel sender with 470Ω pull-up to 3.3V
     cfg->fuel_empty_v           = 1.15f;
     cfg->fuel_full_v            = 0.13f;
-    cfg->fuel_learned_empty_v   = -1.0f;
-    cfg->fuel_learned_full_v    = -1.0f;
     cfg->fuel_emergency_pct     = 25;
     cfg->fuel_warn_on_pct       = 10;
     cfg->fuel_warn_off_pct      = 15;
@@ -66,6 +68,8 @@ void config_set_defaults(dashboard_config_t *cfg)
     cfg->fuel_emergency_time_ms = 30000;
     cfg->fuel_hyst_threshold    = 1;
     cfg->fuel_hyst_cycles       = 3;
+    cfg->fuel_nvs_save_cycles     = 10; /* NVS every N fuel gauge animations; 0 = shutdown only */
+    cfg->fuel_no_read_timeout_ms   = 60000; /* 1 min after boot without fuel ADC → invalidate */
 
     cfg->temp_beta              = 3435.0f;
     cfg->temp_r_nominal         = 2500.0f;
@@ -92,16 +96,17 @@ void config_set_defaults(dashboard_config_t *cfg)
     cfg->blink_on_ms            = 1000;
     cfg->blink_off_ms           = 500;
 
-    cfg->pulses_per_km          = 539;
+    cfg->pulses_per_km          = CONFIG_DEFAULT_PULSES_PER_KM;
     cfg->speed_max_kmh          = 180;
-    cfg->speed_text_interval_ms = 500;
-    cfg->speed_slow_threshold   = 10;
-    cfg->speed_slow_interval_ms = 1000;
     cfg->speed_text_hyst        = 2;
+    cfg->speed_text_interval_ms = 500;
+    cfg->speed_slow_interval_ms = 1000;
+    cfg->speed_slow_threshold   = 100;
     cfg->speed_arc_smooth       = 0.4f;
-    cfg->speed_filter_size      = 5;
-    cfg->speed_max_accel        = 30;
-    cfg->speed_confirm_count    = 3;
+    cfg->speed_glitch_ns        = 1000;
+    cfg->speed_min_period_us    = 1500;
+    cfg->speed_window_ms        = 500;
+    cfg->speed_stopped_ms       = 2000;
 
     cfg->tach_enabled           = 0;
     cfg->tach_pulses_per_rev    = 1;
@@ -138,6 +143,8 @@ void config_set_defaults(dashboard_config_t *cfg)
     cfg->adc_fuel_ch            = 0;
     cfg->adc_temp_ch            = 1;
 
+    cfg->i2c_scl_hz             = 100000;
+
     cfg->shutdown_delay_s       = 5;
 
     cfg->wifi_start_delay_s     = 10;
@@ -145,6 +152,32 @@ void config_set_defaults(dashboard_config_t *cfg)
     cfg->wifi_active_timeout_s  = 600;
     strncpy(cfg->wifi_ssid, "Dr.Agon", sizeof(cfg->wifi_ssid) - 1);
     strncpy(cfg->wifi_pass, "cykablyat", sizeof(cfg->wifi_pass) - 1);
+}
+
+void config_sanitize(dashboard_config_t *cfg)
+{
+    if (cfg->pulses_per_km == 0)
+        cfg->pulses_per_km = CONFIG_DEFAULT_PULSES_PER_KM;
+    if (cfg->temp_r_nominal < 1.0f)
+        cfg->temp_r_nominal = 2500.0f;
+    if (cfg->temp_beta < 1.0f)
+        cfg->temp_beta = 3435.0f;
+    if (cfg->tach_pulses_per_rev == 0)
+        cfg->tach_pulses_per_rev = 1;
+    if (cfg->voltage_multiplier < 0.01f)
+        cfg->voltage_multiplier = 5.02f;
+    if (cfg->speed_window_ms == 0)
+        cfg->speed_window_ms = 500;
+    if (cfg->speed_stopped_ms == 0)
+        cfg->speed_stopped_ms = 2000;
+    if (cfg->fuel_nvs_save_cycles > 5000)
+        cfg->fuel_nvs_save_cycles = 5000;
+    if (cfg->fuel_no_read_timeout_ms > 86400000u)
+        cfg->fuel_no_read_timeout_ms = 86400000u;
+    if (cfg->i2c_scl_hz < 50000u)
+        cfg->i2c_scl_hz = 100000u;
+    if (cfg->i2c_scl_hz > 1000000u)
+        cfg->i2c_scl_hz = 1000000u;
 }
 
 // ============================================================================
@@ -162,61 +195,97 @@ static uint32_t config_calc_crc(const dashboard_config_t *cfg)
     return esp_crc32_le(0, (const uint8_t *)cfg, sizeof(*cfg));
 }
 
-bool hal_nvs_load_config(void)
+/** One-time: legacy CRC blob -> cfg_json, then erase legacy key. */
+static bool migrate_legacy_config_blob_to_json(void)
 {
-    config_set_defaults(&g_config);
-
     config_nvs_t stored;
     size_t size = sizeof(stored);
     esp_err_t ret = nvs_get_blob(s_config_handle, CONFIG_KEY, &stored, &size);
-
-    if (ret != ESP_OK || size != sizeof(stored)) {
-        ESP_LOGW(TAG, "No config in NVS, using defaults");
+    if (ret != ESP_OK || size != sizeof(stored))
         return false;
-    }
 
     if (config_calc_crc(&stored.cfg) != stored.crc32) {
-        ESP_LOGE(TAG, "Config CRC mismatch, using defaults");
-        return false;
-    }
-
-    if (stored.cfg.version != CONFIG_VERSION) {
-        ESP_LOGW(TAG, "Config version %u != %u, using defaults",
-                 stored.cfg.version, CONFIG_VERSION);
+        ESP_LOGW(TAG, "Legacy config CRC mismatch, skipping migration");
         return false;
     }
 
     memcpy(&g_config, &stored.cfg, sizeof(g_config));
+    g_config.version = CONFIG_VERSION;
+    config_apply_forced_defaults(&g_config);
+    config_sanitize(&g_config);
 
-    // Sanitize critical fields to prevent division-by-zero / math crashes
-    if (g_config.pulses_per_km == 0)       g_config.pulses_per_km = 539;
-    if (g_config.temp_r_nominal < 1.0f)    g_config.temp_r_nominal = 2500.0f;
-    if (g_config.temp_beta < 1.0f)         g_config.temp_beta = 3435.0f;
-    if (g_config.speed_filter_size < 1)    g_config.speed_filter_size = 5;
-    if (g_config.speed_filter_size > 9)    g_config.speed_filter_size = 9;
-    if (g_config.speed_confirm_count < 1)  g_config.speed_confirm_count = 3;
-    if (g_config.tach_pulses_per_rev == 0) g_config.tach_pulses_per_rev = 1;
-    if (g_config.voltage_multiplier < 0.01f) g_config.voltage_multiplier = 5.02f;
-
-    ESP_LOGI(TAG, "Config loaded from NVS (v%u)", g_config.version);
+    char *json = dashboard_config_to_json(false);
+    if (!json) {
+        ESP_LOGE(TAG, "Legacy migrate: JSON alloc failed");
+        return true;
+    }
+    ret = nvs_set_blob(s_config_handle, CFG_JSON_KEY, json, strlen(json) + 1);
+    free(json);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Legacy migrate: write cfg_json failed: %s", esp_err_to_name(ret));
+        return true;
+    }
+    nvs_erase_key(s_config_handle, CONFIG_KEY);
+    nvs_commit(s_config_handle);
+    ESP_LOGI(TAG, "Migrated legacy config blob to cfg_json");
     return true;
+}
+
+bool hal_nvs_load_config(void)
+{
+    bool loaded_from_nvs = false;
+
+    config_set_defaults(&g_config);
+
+    const size_t cap = 20 * 1024;
+    char *buf = malloc(cap + 1);
+    if (buf) {
+        size_t size = cap;
+        esp_err_t ret = nvs_get_blob(s_config_handle, CFG_JSON_KEY, buf, &size);
+        if (ret == ESP_OK && size > 0 && size <= cap) {
+            buf[size] = '\0';
+            if (dashboard_config_from_json(buf, false))
+                loaded_from_nvs = true;
+            else
+                ESP_LOGW(TAG, "cfg_json parse failed");
+        }
+        free(buf);
+    }
+
+    if (!loaded_from_nvs && migrate_legacy_config_blob_to_json())
+        loaded_from_nvs = true;
+
+    config_sanitize(&g_config);
+
+    if (loaded_from_nvs)
+        ESP_LOGI(TAG, "Config loaded from NVS (v%u)", g_config.version);
+    else
+        ESP_LOGW(TAG, "No valid config in NVS, using defaults");
+
+    return loaded_from_nvs;
 }
 
 bool hal_nvs_save_config(void)
 {
+    config_sanitize(&g_config);
     g_config.version = CONFIG_VERSION;
 
-    config_nvs_t blob;
-    memcpy(&blob.cfg, &g_config, sizeof(g_config));
-    blob.crc32 = config_calc_crc(&blob.cfg);
-
-    esp_err_t ret = nvs_set_blob(s_config_handle, CONFIG_KEY, &blob, sizeof(blob));
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to write config: %s", esp_err_to_name(ret));
+    char *json = dashboard_config_to_json(false);
+    if (!json) {
+        ESP_LOGE(TAG, "Config JSON alloc failed");
         return false;
     }
+
+    esp_err_t ret = nvs_set_blob(s_config_handle, CFG_JSON_KEY, json, strlen(json) + 1);
+    free(json);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to write cfg_json: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    nvs_erase_key(s_config_handle, CONFIG_KEY);
     nvs_commit(s_config_handle);
-    ESP_LOGI(TAG, "Config saved to NVS");
+    ESP_LOGI(TAG, "Config saved to NVS (JSON)");
     return true;
 }
 
@@ -403,13 +472,52 @@ void hal_nvs_save_odometer(uint32_t km)
     cached_km = km;
 }
 
-void hal_nvs_save_meters(uint32_t meters)
+uint32_t hal_nvs_add_distance_m(uint32_t delta_m)
 {
-    cached_meters = meters % 1000;
-    
-    // If we accumulated another km, save
-    if (meters >= 1000) {
-        cached_km += meters / 1000;
+    if (delta_m == 0)
+        return cached_km;
+
+    uint32_t prev_km = cached_km;
+    uint64_t total_m = (uint64_t)cached_km * 1000ULL + (uint64_t)cached_meters + (uint64_t)delta_m;
+    cached_km = (uint32_t)(total_m / 1000);
+    cached_meters = (uint32_t)(total_m % 1000);
+
+    if (cached_km != prev_km)
         hal_nvs_save_odometer(cached_km);
+
+    return cached_km;
+}
+
+bool hal_nvs_load_last_fuel_pct(uint8_t *out_pct)
+{
+    if (!out_pct)
+        return false;
+    uint8_t v = 255;
+    esp_err_t err = nvs_get_u8(s_config_handle, FUEL_LAST_PCT_KEY, &v);
+    if (err != ESP_OK)
+        return false;
+    if (v > 100)
+        return false;
+    *out_pct = v;
+    return true;
+}
+
+void hal_nvs_save_last_fuel_pct(uint8_t pct)
+{
+    if (pct > 100)
+        return;
+    esp_err_t err = nvs_set_u8(s_config_handle, FUEL_LAST_PCT_KEY, pct);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "fuel_last save failed: %s", esp_err_to_name(err));
+        return;
     }
+    nvs_commit(s_config_handle);
+}
+
+void hal_nvs_erase_last_fuel_pct(void)
+{
+    esp_err_t err = nvs_erase_key(s_config_handle, FUEL_LAST_PCT_KEY);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
+        ESP_LOGW(TAG, "fuel_last erase failed: %s", esp_err_to_name(err));
+    nvs_commit(s_config_handle);
 }

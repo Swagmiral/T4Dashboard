@@ -1,8 +1,8 @@
 {
   "navigation": {
     "selectedUserPageObject": "[EEZ_T4Dashboard.eez-project]:/userPages/0",
-    "selectedFontObject": "[EEZ_T4Dashboard.eez-project]:/fonts/1",
-    "selectedBitmapObject": "[EEZ_T4Dashboard.eez-project]:/bitmaps/17",
+    "selectedFontObject": "[EEZ_T4Dashboard.eez-project]:/fonts/2",
+    "selectedBitmapObject": "[EEZ_T4Dashboard.eez-project]:/bitmaps/11",
     "subnavigationSelectedItems": {}
   },
   "layoutModel": {
@@ -24,7 +24,7 @@
           {
             "type": "border",
             "selected": 2,
-            "size": 240,
+            "size": 237.5,
             "location": "right",
             "children": [
               {
@@ -72,7 +72,7 @@
           {
             "type": "border",
             "selected": 0,
-            "size": 158.5,
+            "size": 0,
             "location": "bottom",
             "children": [
               {
@@ -190,26 +190,27 @@
             {
               "type": "tabset",
               "id": "EDITORS",
-              "weight": 64.28100987925357,
+              "weight": 59.950059074417,
               "selected": 1,
               "enableDeleteWhenEmpty": false,
               "enableClose": false,
               "children": [
                 {
                   "type": "tab",
-                  "id": "#6bf85117-601b-442c-b700-e6a1b1970547",
-                  "name": "Eurostile_Bold_95w_Medium",
+                  "id": "#28166c36-044f-45f6-9647-2ca953d904da",
+                  "name": "Settings",
                   "component": "editor",
                   "config": {
-                    "objectPath": "[EEZ_T4Dashboard.eez-project]:/fonts/1",
+                    "objectPath": "[EEZ_T4Dashboard.eez-project]:/settings",
+                    "subObjectPath": "[EEZ_T4Dashboard.eez-project]:/settings",
                     "permanent": false
                   },
-                  "icon": "material:font_download"
+                  "icon": "material:settings"
                 },
                 {
                   "type": "tab",
                   "id": "#5a4d9656-f6a9-486b-8334-ff2300380b80",
-                  "name": "Main",
+                  "name": "main",
                   "component": "editor",
                   "config": {
                     "objectPath": "[EEZ_T4Dashboard.eez-project]:/userPages/0",
@@ -217,18 +218,17 @@
                   },
                   "icon": "svg:page"
                 }
-              ],
-              "active": true
+              ]
             },
             {
               "type": "row",
               "id": "#dc8d4e3a-a4e2-43ab-b055-84fa893c3ac3",
-              "weight": 20,
+              "weight": 24.330950804836558,
               "children": [
                 {
                   "type": "tabset",
                   "id": "#7dc81ce0-15bd-49de-a28e-151d45f3d02e",
-                  "weight": 2.146892655367232,
+                  "weight": 1.8076036866359446,
                   "children": [
                     {
                       "type": "tab",
@@ -238,12 +238,13 @@
                       "enableClose": false,
                       "icon": "svg:properties"
                     }
-                  ]
+                  ],
+                  "active": true
                 },
                 {
                   "type": "tabset",
                   "id": "#94041f8e-73d4-40f1-b25a-063cff852461",
-                  "weight": 0.8531073446327684,
+                  "weight": 1.1923963133640554,
                   "children": [
                     {
                       "type": "tab",
@@ -514,6 +515,88 @@
                       "id": "DEBUGGER_LOGS",
                       "name": "Logs",
                       "component": "logs",
+                      "enableClose": false,
+                      "icon": "svg:log"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "rootDockerSimulator": {
+      "version": 1,
+      "json": {
+        "global": {
+          "splitterSize": 4,
+          "splitterExtra": 4,
+          "tabEnableRename": false,
+          "borderEnableAutoHide": true
+        },
+        "borders": [],
+        "layout": {
+          "type": "row",
+          "id": "#d26c9601-1214-406d-b0eb-746a1172b37b",
+          "children": [
+            {
+              "type": "tabset",
+              "id": "#1ccecbd7-4b22-4527-a5de-b78cc32fdce6",
+              "weight": 70,
+              "enableDrop": false,
+              "enableDrag": false,
+              "enableClose": false,
+              "enableTabStrip": true,
+              "children": [
+                {
+                  "type": "tab",
+                  "id": "DOCKER_SIMULATOR_PREVIEW",
+                  "name": "Preview",
+                  "component": "dockerSimulatorPreview",
+                  "enableClose": false,
+                  "icon": "material:computer"
+                }
+              ]
+            },
+            {
+              "type": "row",
+              "id": "#376c9b01-f95e-424e-98c5-87b0e73cd109",
+              "weight": 30,
+              "children": [
+                {
+                  "type": "tabset",
+                  "id": "#6b8739a2-d44a-4d0f-9802-5dfcdfe753e0",
+                  "weight": 50,
+                  "enableDrop": false,
+                  "enableDrag": false,
+                  "enableClose": false,
+                  "enableTabStrip": true,
+                  "children": [
+                    {
+                      "type": "tab",
+                      "id": "DOCKER_SIMULATOR_LOGS",
+                      "name": "Build Logs",
+                      "component": "dockerSimulatorLogs",
+                      "enableClose": false,
+                      "icon": "svg:log"
+                    }
+                  ]
+                },
+                {
+                  "type": "tabset",
+                  "id": "#8ef3de89-3131-4a40-bdc5-4b45dda31671",
+                  "weight": 50,
+                  "enableDrop": false,
+                  "enableDrag": false,
+                  "enableClose": false,
+                  "enableTabStrip": true,
+                  "children": [
+                    {
+                      "type": "tab",
+                      "id": "DOCKER_SIMULATOR_PREVIEW_LOGS",
+                      "name": "Preview Logs",
+                      "component": "dockerSimulatorPreviewLogs",
                       "enableClose": false,
                       "icon": "svg:log"
                     }
@@ -1014,16 +1097,35 @@
       },
       "transform": {
         "translate": {
-          "x": -671.5541867380138,
-          "y": -364.11918033459517
+          "x": -181.26339304057973,
+          "y": -331.07556066603655
         },
-        "scale": 1.1
+        "scale": 0.8
       },
       "timeline": {
         "isEditorActive": false,
         "position": 0,
         "secondToPx": 200,
         "scrollLeft": 0
+      },
+      "selectionFront": {},
+      "selectionBack": {
+        "0": {
+          "1": {
+            "$selected": true
+          },
+          "11": {
+            "3": {}
+          },
+          "13": {
+            "0": {},
+            "7": {}
+          },
+          "24": {},
+          "25": {},
+          "27": {},
+          "28": {}
+        }
       }
     }
   },
@@ -1042,11 +1144,13 @@
   "lvglPart": "INDICATOR",
   "lvglState": "DEFAULT",
   "lvglExpandedPropertiesGroup": [
+    "IMAGE",
     "POSITION AND SIZE",
-    "TEXT"
+    "MISCELLANEOUS"
   ],
   "showInactiveFlowsInDebugger": true,
   "globalFlowZoom": true,
-  "flowZoom": 1.1,
-  "implementationLanguage": "C"
+  "flowZoom": 0.8,
+  "implementationLanguage": "C",
+  "openDialogDefaultPath": "D:\\Projects\\T4Dashboard-main\\EEZ project\\EEZ_T4Dashboard\\speedmask.png"
 }

@@ -4,6 +4,7 @@
  */
 
 #include "hal_display.h"
+#include "config.h"
 #include "ui.h"
 #include "dashboard.h"
 #include <string.h>
@@ -32,7 +33,7 @@ static const char *TAG = "display";
 // Display configuration
 #define LCD_H_RES           1024
 #define LCD_V_RES           600
-#define LCD_PIXEL_CLOCK_HZ  (38 * 1000 * 1000)
+#define LCD_PIXEL_CLOCK_HZ  (36 * 1000 * 1000)
 
 // RGB timing
 #define LCD_HSYNC_BACK_PORCH    152
@@ -75,12 +76,39 @@ static SemaphoreHandle_t lvgl_mutex = NULL;
 // Double framebuffers in PSRAM for tear-free rendering
 static void *fb[2] = {NULL, NULL};
 static const size_t fb_bytes = (size_t)LCD_H_RES * (size_t)LCD_V_RES * sizeof(uint16_t);
+static SemaphoreHandle_t flush_done_sem = NULL;
+static lv_display_t *flush_disp = NULL;
+
+static bool IRAM_ATTR on_vsync(esp_lcd_panel_handle_t panel,
+                                const esp_lcd_rgb_panel_event_data_t *data,
+                                void *user_ctx)
+{
+    (void)panel;
+    (void)data;
+    (void)user_ctx;
+    BaseType_t woken = pdFALSE;
+    if (flush_done_sem) {
+        xSemaphoreGiveFromISR(flush_done_sem, &woken);
+    }
+    return woken == pdTRUE;
+}
+
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
     (void)area;
+    /* DIRECT + two full framebuffers: LVGL calls flush once per dirty region, then once
+     * more with lv_display_flush_is_last() true. Pushing the whole screen + VSYNC on
+     * every call causes visible flashing (several full refreshes per value change). */
+    if (!lv_display_flush_is_last(disp)) {
+        lv_display_flush_ready(disp);
+        return;
+    }
+
     esp_cache_msync(px_map, fb_bytes,
                     ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, px_map);
+    flush_disp = disp;
+    xSemaphoreTake(flush_done_sem, pdMS_TO_TICKS(100));
     lv_display_flush_ready(disp);
 }
 
@@ -104,7 +132,7 @@ void hal_display_init_io_expander(i2c_master_bus_handle_t bus)
         i2c_device_config_t dev_cfg = {
             .dev_addr_length = I2C_ADDR_BIT_LEN_7,
             .device_address = IO_EXT_I2C_ADDR,
-            .scl_speed_hz = 100000,
+            .scl_speed_hz = g_config.i2c_scl_hz,
         };
         ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &dev_cfg, &io_ext_dev));
     }
@@ -152,11 +180,8 @@ void hal_display_init(void)
             .flags.pclk_active_neg = 1,
         },
         .data_width = 16,
-        .bits_per_pixel = 16,
         .num_fbs = 2,
-        .bounce_buffer_size_px = LCD_H_RES * 20,
-        .sram_trans_align = 4,
-        .psram_trans_align = 64,
+        .bounce_buffer_size_px = LCD_H_RES * 30,
         .hsync_gpio_num = PIN_LCD_HSYNC,
         .vsync_gpio_num = PIN_LCD_VSYNC,
         .de_gpio_num = PIN_LCD_DE,
@@ -171,6 +196,13 @@ void hal_display_init(void)
     };
     
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_config, &panel_handle));
+
+    flush_done_sem = xSemaphoreCreateBinary();
+    esp_lcd_rgb_panel_event_callbacks_t cbs = {
+        .on_vsync = on_vsync,
+    };
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(panel_handle, &cbs, NULL));
+
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
 
     // Get both framebuffers and clear to black

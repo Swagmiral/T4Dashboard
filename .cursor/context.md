@@ -8,7 +8,7 @@ Custom digital instrument cluster for a 1998 VW Transporter T4 1.9TD, replacing 
 - **Display**: TFT LCD driven via ESP LCD + LVGL
 - **I2C Bus**: MCP23017 (GPIO expander), BH1750 (light sensor), ADS1115 (16-bit ADC)
 - **MCP23017**: Reads digital inputs — ignition, blinkers (L pin 6, R pin 5), glow plug, high beam, etc. Active-low inputs via optocouplers.
-- **ADS1115**: Reads analog signals — battery voltage (ch0), fuel level (ch1), coolant temperature (ch2)
+- **ADS1115**: Reads analog signals — fuel level (AIN0), coolant temperature (AIN1), battery voltage (AIN3). **NOTE**: AIN1/AIN2 are internally shorted on this chip (counterfeit/faulty). Voltage was moved from AIN2 to AIN3 as workaround. Temp on AIN1 still has parasitic coupling from the damaged MUX. Replace with genuine TI ADS1115IDGSR.
 - **Speed Sensor**: VW 357919149 (3-pin Hall effect, open-collector output) on gearbox, signal on cluster pin 27 (NOT pin 28), through 74HC14 Schmitt trigger to GPIO43
 - **Tachometer**: Alternator W terminal signal on GPIO44
 - **MOSFET Self-Latch**: GPIO6 controls power latch for delayed shutdown after ignition off
@@ -59,22 +59,24 @@ The original circuit had NO pull-up resistor. The 357919149 Hall sensor has an o
 - **hal_tach.c**: Tachometer input
 - **hal_i2c.c**: I2C bus init + MCP23017/BH1750/ADS1115 communication
 - **hal_adc.c**: ADS1115 ADC driver
-- **hal_nvs.c**: NVS config storage with validation/sanitization
+- **hal_nvs.c**: NVS config storage with validation/sanitization (CONFIG_VERSION = 15)
 - **hal_wifi.c**: WiFi SoftAP + HTTP config server + live sensor endpoint
 - **hal_display.c**: Display driver + LVGL tick
 - **dashboard.c**: LVGL UI — speedometer arc+label, fuel, temp, indicators
-- **config.h**: Configuration struct (CONFIG_VERSION = 14)
+- **config.h**: Configuration struct (CONFIG_VERSION = 15)
 
 ## Key Firmware Features & Fixes Applied
 
 ### Speed Processing (hal_speed.c)
-- Circular buffer (PBUF_MAX=9) for median filtering of ISR periods
-- Runtime-configurable filter depth via `g_config.speed_filter_size` (default 5, max 9)
-- Rate-of-change limiter: rejects speed jumps exceeding `speed_max_accel` km/h/s unless confirmed by `speed_confirm_count` consecutive samples in the same direction
+- **PCNT hardware pulse counter** with configurable glitch filter (`speed_glitch_ns`, default 1000ns)
+- **GPIO ISR software debounce** rejects pulses closer than `speed_min_period_us` (default 1500µs)
+- **Frequency-based speed**: counts accepted pulses in a sliding window (`speed_window_ms`, default 500ms), calculates speed from time span between first and last pulse
+- **Low speed handling**: when 0-1 pulses in window, uses elapsed time since last pulse as upper-bound estimate (smooth decay toward zero)
+- **No mode switching**: single unified formula works at all speeds without discontinuity
+- **PCNT raw count** drives odometer for accurate distance measurement
+- **Stopped detection**: `speed_stopped_ms` (default 2000ms) no-pulse timeout
 - Division-by-zero guard on `pulses_per_km`
 - `gpio_reset_pin()` calls REMOVED (were causing issues)
-- ISR uses ANYEDGE — reads both rising and falling edges
-- Static buffer in `hal_speed_get_kmh()` to reduce stack usage
 
 ### Display (dashboard.c)
 - Speed label: hysteresis via `speed_text_hyst`, but always updates immediately to 0
@@ -99,13 +101,13 @@ The original circuit had NO pull-up resistor. The 357919149 Hall sensor has an o
 - Config page includes speed_filter_size, speed_max_accel, speed_confirm_count, temp_display_hyst
 
 ### NVS Config (hal_nvs.c)
-- CONFIG_VERSION = 14 (bump required when adding fields)
+- CONFIG_VERSION = 15 (bump required when adding fields)
 - Post-load sanitization prevents crashes from bad values:
   - pulses_per_km: min 539
   - temp_r_nominal: min 2500.0
   - temp_beta: min 3435.0
-  - speed_filter_size: 1-9
-  - speed_confirm_count: min 1
+  - speed_window_ms: min 1
+  - speed_stopped_ms: min 1
   - tach_pulses_per_rev: min 1
   - voltage_multiplier: min 0.01
 
@@ -118,9 +120,26 @@ The original circuit had NO pull-up resistor. The 357919149 Hall sensor has an o
 - Main task stack: 8192 bytes (increased from 3584 to fix overflow)
 - Static buffers in speed calculation to reduce stack pressure
 
+### LVGL Memory Allocator Fix (April 2026)
+- **Problem**: LVGL used its built-in allocator (`LV_USE_BUILTIN_MALLOC`) with a **64KB fixed pool** in internal SRAM. The LVGL bin decoder (`decode_alpha_only` in `lv_bin_decoder.c`) always copies alpha-only images (A4/A8) into a new RAM buffer — even A8 where no conversion is needed. The speedmask image (300x300 A8 = 90KB) exceeded the 64KB pool, causing a silent allocation failure and invisible rendering.
+- **Root cause**: `lv_draw_buf_create()` → `lv_malloc()` → LVGL builtin pool (64KB) → fails for 90KB → decoder returns `LV_RESULT_INVALID` → image widget has no content → invisible.
+- **Fix**: Switched to C stdlib: `CONFIG_LV_USE_CLIB_MALLOC=y` in `sdkconfig.defaults`. With `CONFIG_SPIRAM_USE_MALLOC=y` and `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`, allocations >4KB automatically go to PSRAM. The 90KB speedmask buffer now allocates in PSRAM successfully.
+- **Side benefit**: Freed ~64KB of internal SRAM (.bss dropped from ~82KB to ~17KB) that was previously reserved for LVGL's static pool.
+- **Why smaller images worked**: test5 (200x200 A4 → decoded to 200x200 A8 = 40KB) fit in the 64KB pool. Only images >64KB were affected.
+
+### PSRAM SPI Bus Contention Fix (April 2026)
+- **Problem**: `CONFIG_SPIRAM_RODATA=y` and `CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y` placed read-only data and code in PSRAM, competing with LCD DMA for the PSRAM SPI bus, causing rendering glitches.
+- **Fix**: Disabled both in `sdkconfig.defaults` — const image data stays in flash, code executes from IRAM/flash cache, only framebuffers and heap use PSRAM.
+
 ## sdkconfig.defaults Key Settings
 - `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192`
+- `CONFIG_ESP_MAIN_TASK_PRIORITY=6`
 - `CONFIG_ESP_BROWNOUT_DET_LVL_SEL_3=y` (lowered from level 7)
+- `CONFIG_LV_USE_CLIB_MALLOC=y` (use C stdlib, NOT LVGL builtin 64KB pool)
+- `CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y` (critical LVGL code in IRAM)
+- `CONFIG_COMPILER_OPTIMIZATION_PERF=y`
+- `# CONFIG_SPIRAM_RODATA is not set` (keep rodata in flash, not PSRAM)
+- `# CONFIG_SPIRAM_FETCH_INSTRUCTIONS is not set` (keep code in flash, not PSRAM)
 - Log level: WARN default, INFO max
 - Console: default (UART0) — DO NOT change to USB-JTAG or NONE
 - **IMPORTANT**: Always `del sdkconfig` before building after changing sdkconfig.defaults
@@ -136,11 +155,18 @@ The original circuit had NO pull-up resistor. The 357919149 Hall sensor has an o
 8. **DNS task crash on WiFi shutdown** → Properly close dns_sock and wait for task exit
 9. **Speed label stuck at non-zero** → Fixed hysteresis to always allow update to 0
 10. **Fuel reads 3-5% then 0 at boot** → Added adc_settle counter (skip first 2 readings)
+11. **Speedmask image invisible** → LVGL 64KB builtin allocator too small for 90KB decoded A8 image; switched to `CONFIG_LV_USE_CLIB_MALLOC=y` so large allocs go to PSRAM
+12. **PSRAM bus contention causing rendering glitches** → Disabled `SPIRAM_RODATA` and `SPIRAM_FETCH_INSTRUCTIONS` in sdkconfig.defaults
+13. **A8 image decode wastes PSRAM** → LVGL `decode_alpha_only` copies A8 C-arrays to PSRAM unnecessarily; patched `lv_bin_decoder.c` to use const data directly from flash (zero-copy) for A8 format
+14. **Speed label constant invalidation** → `lv_label_set_text_fmt` always invalidates even for same text; added `if (kmh == displayed_speed) return` guard in `dashboard_set_speed`
+15. **ADS1115 counterfeit — AIN1/AIN2 internal MUX short** → Diagnosed via raw ADC logging through `/sensors` endpoint. Both AIN1 and AIN2 returned identical voltages (~20mV offset). Disconnecting NTC from AIN1 caused BOTH channels to jump to 3.2V (pullup voltage). Confirmed chip's internal MUX is dead between those two adjacent pins. **Workaround**: moved battery voltage from AIN2 to AIN3 (config: `adc_voltage_ch=3`). Voltage and fuel now read correctly. Temp on AIN1 still shows ~18% parasitic coupling to battery voltage changes through the damaged MUX. Current channel layout: AIN0=fuel, AIN1=temp (degraded), AIN2=unused (dead), AIN3=voltage.
 
 ## Current Status (April 2026)
-- **Working**: Display, blinkers, fuel gauge, temperature, high beam, voltage, glow plug, WiFi config page with live sensors
+- **Working**: Display, blinkers, fuel gauge, temperature, high beam, voltage, glow plug, WiFi config page with live sensors, speedmask rendering
 - **Speedometer**: Works on bench (tapping), pull-up resistor fix applied but NOT YET TESTED IN CAR
 - **Tachometer**: Not yet verified (alternator W terminal)
+- **Known issue**: Temp gauge still has residual voltage dependency (~18% reading shift for ~3% battery change) due to damaged AIN1 on counterfeit ADS1115. Fuel (AIN0) and voltage (AIN3) are unaffected. Full fix requires replacing the ADS1115 chip with genuine TI part.
+- **Fixed**: Speed text + KM/H flashing — A8 zero-copy patch in bin decoder + early-return guard in `dashboard_set_speed` to stop constant label invalidation
 - **Git repo**: https://github.com/Swagmiral/T4Dashboard (just pushed, all current code)
 
 ## Things NOT to Do

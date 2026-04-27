@@ -1,7 +1,7 @@
 #ifndef EEZ_LVGL_UI_IMAGES_H
 #define EEZ_LVGL_UI_IMAGES_H
 
-#include "lvgl.h"
+#include <lvgl/lvgl.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,9 +22,7 @@ extern const lv_img_dsc_t img_speedmask;
 extern const lv_img_dsc_t img_temp_indicator;
 extern const lv_img_dsc_t img_glowplug_notification;
 extern const lv_img_dsc_t img_led;
-extern const lv_img_dsc_t img_pointgrid;
 extern const lv_img_dsc_t img_icon_wifi;
-extern const lv_img_dsc_t img_speedogrid;
 
 #ifndef EXT_IMG_DESC_T
 #define EXT_IMG_DESC_T
@@ -34,8 +32,7 @@ typedef struct _ext_img_desc_t {
 } ext_img_desc_t;
 #endif
 
-extern const ext_img_desc_t images[18];
-
+extern const ext_img_desc_t images[16];
 
 #ifdef __cplusplus
 }

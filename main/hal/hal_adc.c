@@ -9,6 +9,7 @@
  */
 
 #include "hal_adc.h"
+#include "config.h"
 #include "esp_log.h"
 #include "driver/i2c_master.h"
 
@@ -47,7 +48,7 @@ void hal_adc_init(i2c_master_bus_handle_t bus)
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = ADS1115_ADDR,
-        .scl_speed_hz = 100000,
+        .scl_speed_hz = g_config.i2c_scl_hz,
     };
     esp_err_t ret = i2c_master_bus_add_device(bus, &dev_cfg, &ads_dev);
     if (ret != ESP_OK) {
@@ -88,9 +89,22 @@ bool hal_adc_read_raw(float *v_adc_out)
 {
     if (v_adc_out == NULL || !ads_ok) return false;
 
-    uint8_t reg = ADS1115_REG_CONVERSION;
+    uint8_t reg = ADS1115_REG_CONFIG;
+    uint8_t cfg[2] = {0};
+    esp_err_t ret = i2c_master_transmit_receive(ads_dev, &reg, 1, cfg, 2, 10);
+    if (ret != ESP_OK) {
+        if (++ads_fail_cnt >= ADS_FAIL_LIMIT) {
+            ads_ok = false;
+            ESP_LOGW(TAG, "ADS1115 lost - ADC disabled");
+        }
+        return false;
+    }
+
+    if (!(cfg[0] & 0x80)) return false;
+
+    reg = ADS1115_REG_CONVERSION;
     uint8_t data[2] = {0};
-    esp_err_t ret = i2c_master_transmit_receive(ads_dev, &reg, 1, data, 2, 10);
+    ret = i2c_master_transmit_receive(ads_dev, &reg, 1, data, 2, 10);
     if (ret != ESP_OK) {
         if (++ads_fail_cnt >= ADS_FAIL_LIMIT) {
             ads_ok = false;

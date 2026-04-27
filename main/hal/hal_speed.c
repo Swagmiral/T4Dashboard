@@ -1,8 +1,16 @@
 /**
- * Speed sensor HAL — period measurement via GPIO interrupt
+ * Speed sensor HAL — PCNT hardware counting + software debounce
  *
- * Measures time between consecutive rising edges from the
- * VW T4 speed sensor (539 pulses/km) on GPIO43.
+ * Two-layer approach:
+ *   1. ESP32-S3 PCNT peripheral counts raw pulses with HW glitch filter
+ *      → used for odometer (total distance)
+ *   2. GPIO ISR with software debounce (min period check) records
+ *      timestamps of accepted pulses → used for speed calculation
+ *
+ * Speed is computed from the time span between first and last accepted
+ * pulse within a sliding window. At very low speed (0-1 pulses in window),
+ * the elapsed time since the last pulse provides an upper-bound estimate
+ * that decays smoothly toward zero.
  */
 
 #include "hal_speed.h"
@@ -10,23 +18,27 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
+#include "driver/pulse_cnt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 
-#define SPEED_GPIO          GPIO_NUM_43
-#define STOPPED_TIMEOUT_US  (2 * 1000 * 1000LL)
-#define MIN_PERIOD_US       1000  // reject noise shorter than 1ms
-#define PBUF_MAX            9     // max configurable median depth
+#define SPEED_GPIO  GPIO_NUM_43
 
-static volatile int64_t last_edge_us = 0;
-static volatile int64_t period_buf[PBUF_MAX];
-static volatile uint8_t pbuf_idx = 0;
-static volatile uint8_t pbuf_cnt = 0;
-static volatile uint32_t pulse_count = 0;
-static uint8_t pbuf_size = 5;    // runtime filter depth from config
-static int64_t init_time_us = 0;
+static pcnt_unit_handle_t pcnt_unit = NULL;
+static pcnt_channel_handle_t pcnt_chan = NULL;
 
-#define STARTUP_GRACE_US  (500 * 1000LL)
+static volatile int64_t last_accepted_us = 0;
+static volatile int64_t window_first_us = 0;
+static volatile int64_t window_last_us = 0;
+static volatile uint32_t window_count = 0;
+static volatile uint32_t prev_window_count = 0;
+static volatile int64_t prev_first_us = 0;
+static volatile int64_t prev_last_us = 0;
+static volatile int64_t window_start_us = 0;
+
+static uint32_t min_period_us = 1500;
+static uint16_t window_ms = 500;
+static uint16_t stopped_ms = 2000;
 
 static portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -35,33 +47,55 @@ static void IRAM_ATTR speed_isr(void *arg)
     (void)arg;
     int64_t now = esp_timer_get_time();
 
-    if (now - init_time_us < STARTUP_GRACE_US) return;
-
     portENTER_CRITICAL_ISR(&spinlock);
-    int64_t dt = now - last_edge_us;
-    if (dt >= MIN_PERIOD_US) {
-        last_edge_us = now;
-        pulse_count++;
-        if (dt > STOPPED_TIMEOUT_US) {
-            pbuf_cnt = 0;
-            pbuf_idx = 0;
-        } else {
-            period_buf[pbuf_idx] = dt;
-            pbuf_idx = (pbuf_idx + 1) % pbuf_size;
-            if (pbuf_cnt < pbuf_size) pbuf_cnt++;
-        }
+    int64_t dt = now - last_accepted_us;
+    if (dt >= (int64_t)min_period_us) {
+        last_accepted_us = now;
+        if (window_count == 0)
+            window_first_us = now;
+        window_last_us = now;
+        window_count++;
     }
     portEXIT_CRITICAL_ISR(&spinlock);
 }
 
 void hal_speed_init(void)
 {
-    init_time_us = esp_timer_get_time();
+    min_period_us = g_config.speed_min_period_us;
+    if (min_period_us == 0) min_period_us = 1500;
 
-    uint8_t fs = g_config.speed_filter_size;
-    if (fs < 1) fs = 1;
-    if (fs > PBUF_MAX) fs = PBUF_MAX;
-    pbuf_size = fs;
+    window_ms = g_config.speed_window_ms;
+    if (window_ms == 0) window_ms = 500;
+
+    stopped_ms = g_config.speed_stopped_ms;
+    if (stopped_ms == 0) stopped_ms = 2000;
+
+    uint16_t glitch_ns = g_config.speed_glitch_ns;
+    if (glitch_ns == 0) glitch_ns = 1000;
+
+    pcnt_unit_config_t unit_cfg = {
+        .high_limit = 32767,
+        .low_limit = -1,
+        .flags.accum_count = true,
+    };
+    ESP_ERROR_CHECK(pcnt_new_unit(&unit_cfg, &pcnt_unit));
+
+    pcnt_glitch_filter_config_t filt_cfg = {
+        .max_glitch_ns = glitch_ns,
+    };
+    ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(pcnt_unit, &filt_cfg));
+
+    pcnt_chan_config_t chan_cfg = {
+        .edge_gpio_num = SPEED_GPIO,
+        .level_gpio_num = -1,
+    };
+    ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chan_cfg, &pcnt_chan));
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(pcnt_chan,
+        PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_HOLD));
+
+    ESP_ERROR_CHECK(pcnt_unit_enable(pcnt_unit));
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
+    ESP_ERROR_CHECK(pcnt_unit_start(pcnt_unit));
 
     gpio_config_t io_cfg = {
         .pin_bit_mask = (1ULL << SPEED_GPIO),
@@ -74,116 +108,94 @@ void hal_speed_init(void)
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     gpio_isr_handler_add(SPEED_GPIO, speed_isr, NULL);
 
-    ESP_LOGI("speed", "Speed sensor on GPIO%d (%u pulses/km, filter=%u, accel=%u, confirm=%u)",
-             SPEED_GPIO, g_config.pulses_per_km, pbuf_size,
-             g_config.speed_max_accel, g_config.speed_confirm_count);
-}
+    window_start_us = esp_timer_get_time();
 
-static int64_t median_period(int64_t *a, uint8_t n)
-{
-    for (uint8_t i = 1; i < n; i++) {
-        int64_t key = a[i];
-        int8_t j = i - 1;
-        while (j >= 0 && a[j] > key) {
-            a[j + 1] = a[j];
-            j--;
-        }
-        a[j + 1] = key;
-    }
-    return a[n / 2];
+    ESP_LOGI("speed", "PCNT+ISR on GPIO%d (ppk=%u, glitch=%uns, debounce=%uus, window=%ums)",
+             SPEED_GPIO, g_config.pulses_per_km, glitch_ns, min_period_us, window_ms);
 }
 
 uint16_t hal_speed_get_kmh(void)
 {
-    static uint16_t accepted = 0;
-    static int64_t last_call_us = 0;
-    static uint8_t confirm_cnt = 0;
-    static int8_t confirm_dir = 0;  // +1 = accel, -1 = decel
-
     int64_t now = esp_timer_get_time();
-    static int64_t buf[PBUF_MAX];
-    uint8_t cnt, idx;
-    int64_t last;
+    int64_t window_us = (int64_t)window_ms * 1000;
+    int64_t stopped_us = (int64_t)stopped_ms * 1000;
 
+    bool rolled = false;
     portENTER_CRITICAL(&spinlock);
-    cnt = pbuf_cnt;
-    idx = pbuf_idx;
-    for (uint8_t i = 0; i < cnt; i++) buf[i] = period_buf[i];
-    last = last_edge_us;
+    int64_t last_accepted = last_accepted_us;
+
+    if ((now - window_start_us) >= window_us) {
+        rolled = true;
+        prev_window_count = window_count;
+        prev_first_us = window_first_us;
+        prev_last_us = window_last_us;
+        window_count = 0;
+        window_first_us = 0;
+        window_last_us = 0;
+    }
+
+    uint32_t prev_cnt = prev_window_count;
+    int64_t prev_first = prev_first_us;
+    int64_t prev_last = prev_last_us;
+    uint32_t live_cnt = window_count;
+    int64_t live_first = window_first_us;
+    int64_t live_last = window_last_us;
     portEXIT_CRITICAL(&spinlock);
 
-    if (cnt == 0 || (now - last) > STOPPED_TIMEOUT_US) {
-        accepted = 0;
-        confirm_cnt = 0;
-        last_call_us = now;
+    if (rolled) {
+        window_start_us = now;
+    }
+
+    if ((now - last_accepted) > stopped_us) {
         return 0;
     }
 
-    int64_t p;
-    if (cnt >= 3)
-        p = median_period(buf, cnt);
-    else
-        p = buf[(idx + pbuf_size - 1) % pbuf_size];
-
     uint16_t ppk = g_config.pulses_per_km;
-    if (ppk == 0) ppk = 539;
-    uint32_t speed = (uint32_t)(3600000000LL / (p * ppk));
-    if (speed > 200) speed = 0;
+    if (ppk == 0) ppk = CONFIG_DEFAULT_PULSES_PER_KM;
 
-    uint8_t max_accel = g_config.speed_max_accel;
-    uint8_t confirm_limit = g_config.speed_confirm_count;
-    if (confirm_limit < 1) confirm_limit = 1;
-
-    if (max_accel == 0 || accepted == 0) {
-        accepted = (uint16_t)speed;
-        confirm_cnt = 0;
-    } else {
-        int32_t delta = (int32_t)speed - (int32_t)accepted;
-        int64_t dt_us = now - last_call_us;
-        if (dt_us < 1000) dt_us = 1000;
-
-        int32_t max_delta = (int32_t)max_accel * dt_us / 1000000;
-        if (max_delta < 1) max_delta = 1;
-
-        int32_t abs_delta = delta < 0 ? -delta : delta;
-
-        if (abs_delta <= max_delta) {
-            accepted = (uint16_t)speed;
-            confirm_cnt = 0;
-        } else {
-            int8_t dir = (delta > 0) ? 1 : -1;
-            if (dir == confirm_dir) {
-                confirm_cnt++;
-            } else {
-                confirm_dir = dir;
-                confirm_cnt = 1;
-            }
-            if (confirm_cnt >= confirm_limit) {
-                accepted = (uint16_t)speed;
-                confirm_cnt = 0;
-            }
-        }
+    /* In-progress window: need 2+ accepted pulses so speed comes from real edge timing.
+     * (Old path used cnt==0 && last_accepted with elapsed clamped to min_period_us, which
+     *  produced ~999 km/h on the first pulse then decayed — wrong.) */
+    if (live_cnt >= 2 && live_last > live_first) {
+        int64_t span_us = live_last - live_first;
+        uint32_t edges = live_cnt - 1;
+        uint32_t speed = (uint32_t)((3600000000LL * edges) / (span_us * ppk));
+        if (speed > 999) speed = 999;
+        return (uint16_t)speed;
     }
 
-    last_call_us = now;
-    return accepted;
+    if (prev_cnt >= 2 && prev_last > prev_first) {
+        int64_t span_us = prev_last - prev_first;
+        uint32_t edges = prev_cnt - 1;
+        uint32_t speed = (uint32_t)((3600000000LL * edges) / (span_us * ppk));
+        if (speed > 999) speed = 999;
+        return (uint16_t)speed;
+    }
+
+    /* Exactly one pulse in the last completed window — decay estimate (nearly stopped). */
+    if (prev_cnt == 1) {
+        int64_t elapsed = now - last_accepted;
+        if (elapsed < (int64_t)min_period_us)
+            elapsed = min_period_us;
+        uint32_t max_speed = (uint32_t)(3600000000LL / (elapsed * ppk));
+        if (max_speed > 999) max_speed = 999;
+        return (uint16_t)max_speed;
+    }
+
+    return 0;
 }
 
 uint32_t hal_speed_get_distance_m(void)
 {
-    uint32_t count;
-    portENTER_CRITICAL(&spinlock);
-    count = pulse_count;
-    portEXIT_CRITICAL(&spinlock);
+    int pcnt_val = 0;
+    pcnt_unit_get_count(pcnt_unit, &pcnt_val);
 
     uint16_t ppk = g_config.pulses_per_km;
-    if (ppk == 0) ppk = 539;
-    return (uint32_t)((uint64_t)count * 1000 / ppk);
+    if (ppk == 0) ppk = CONFIG_DEFAULT_PULSES_PER_KM;
+    return (uint32_t)((uint64_t)(uint32_t)pcnt_val * 1000 / ppk);
 }
 
 void hal_speed_reset_distance(void)
 {
-    portENTER_CRITICAL(&spinlock);
-    pulse_count = 0;
-    portEXIT_CRITICAL(&spinlock);
+    pcnt_unit_clear_count(pcnt_unit);
 }

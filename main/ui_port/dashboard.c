@@ -3,6 +3,7 @@
 #include "hal_wifi.h"
 #include "hal_i2c.h"
 #include "hal_adc.h"
+#include "hal_nvs.h"
 #include "screens.h"
 #include "ui.h"
 #include <string.h>
@@ -95,6 +96,8 @@ static struct {
     .hysteresis_count = 0,
     .hysteresis_value = 0
 };
+
+static uint16_t s_fuel_nvs_cycles_since_save;
 
 // ============================================================================
 // INPUT DEBOUNCE SYSTEM (Hybrid: interrupt-triggered + sample confirmation)
@@ -265,8 +268,10 @@ void dashboard_init(void) {
     }
     
     // Initial values (set directly, not via dashboard_set_* which has early-return guards)
-    if (objects.speedo && lv_obj_is_valid(objects.speedo))
+    if (objects.speedo && lv_obj_is_valid(objects.speedo)) {
+        lv_arc_set_range(objects.speedo, 0, 1000);
         lv_arc_set_value(objects.speedo, 0);
+    }
     if (objects.speed && lv_obj_is_valid(objects.speed))
         lv_label_set_text(objects.speed, "0");
 
@@ -321,10 +326,27 @@ void dashboard_init(void) {
         lv_obj_set_style_bg_color(objects.fuel_bar, lv_color_hex(g_config.color_bar_bg), LV_PART_MAIN);
     if (objects.temperature)
         lv_obj_set_style_bg_color(objects.temperature, lv_color_hex(g_config.color_bar_bg), LV_PART_MAIN);
-    if (objects.speedogrid)
-        lv_obj_set_style_image_recolor(objects.speedogrid, lv_color_hex(g_config.color_speedo_bg), 0);
-    if (objects.speedo)
+    if (objects.speedo) {
+        lv_obj_set_style_arc_color(objects.speedo, lv_color_hex(g_config.color_speedo_bg), LV_PART_MAIN);
         lv_obj_set_style_arc_color(objects.speedo, lv_color_hex(g_config.color_speedo_ind), LV_PART_INDICATOR);
+    }
+
+    /* Speed / km·h labels: opaque bg avoids re-blend flash over arc + mask; black plate vs arc track. */
+    if (objects.speed && lv_obj_is_valid(objects.speed)) {
+        lv_obj_set_style_bg_opa(objects.speed, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(objects.speed, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_pad_hor(objects.speed, 20, 0);
+        lv_obj_set_style_pad_ver(objects.speed, 16, 0);
+        lv_obj_set_width(objects.speed, 380);
+        lv_obj_set_height(objects.speed, LV_SIZE_CONTENT);
+        lv_obj_set_style_text_align(objects.speed, LV_TEXT_ALIGN_CENTER, 0);
+    }
+    if (objects.kmh && lv_obj_is_valid(objects.kmh)) {
+        lv_obj_set_style_bg_opa(objects.kmh, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(objects.kmh, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_pad_hor(objects.kmh, 16, 0);
+        lv_obj_set_style_pad_ver(objects.kmh, 8, 0);
+    }
 
     // Mark disabled indicators (pin=255) with disabled color
     dis_blinker_l = (g_config.pin_blinker_l == 255);
@@ -350,34 +372,43 @@ void dashboard_set_speed(uint16_t kmh) {
     uint16_t prev_speed = current_speed;
     current_speed = kmh;
 
-    // Arc: always update EMA so it keeps smoothing toward target
+    // Arc: always update EMA so it keeps smoothing toward target (0-1000 range).
+    // Only push to LVGL when the displayed arc value changes — DIRECT mode + full
+    // flush makes every lv_arc_set_value() expensive and causes visible flashing.
     if (objects.speedo && lv_obj_is_valid(objects.speedo)) {
         static float arc_ema = 0.0f;
+        static uint16_t last_arc_sent = 0xFFFF;
         uint16_t smax = g_config.speed_max_kmh ? g_config.speed_max_kmh : 180;
-        float target = (kmh >= smax) ? 100.0f : (kmh * 100.0f / smax);
+        float target = (kmh >= smax) ? 1000.0f : (kmh * 1000.0f / smax);
         float alpha = g_config.speed_arc_smooth;
         if (alpha <= 0.0f || alpha > 1.0f) alpha = 1.0f;
-        if (prev_speed == 0xFFFF || (prev_speed == 0 && kmh > 0))
-            arc_ema = target;
-        else
-            arc_ema += alpha * (target - arc_ema);
+        arc_ema += alpha * (target - arc_ema);
         if (arc_ema < 0.5f) arc_ema = 0.0f;
-        uint8_t pct = (uint8_t)(arc_ema + 0.5f);
-        lv_arc_set_value(objects.speedo, pct);
+        uint16_t val = (uint16_t)(arc_ema + 0.5f);
+        if (val != last_arc_sent) {
+            lv_arc_set_value(objects.speedo, val);
+            last_arc_sent = val;
+        }
     }
 
     if (glow_plug_on && kmh != prev_speed && ((prev_speed == 0) != (kmh == 0))) {
         update_glow_plug_display();
     }
 
-    // Label: throttled with hysteresis
+    // Label: time-throttled with hysteresis
     static uint32_t last_text_update = 0;
     static uint16_t displayed_speed = 0;
     uint32_t now = lv_tick_get();
-    uint16_t interval = (kmh < g_config.speed_slow_threshold)
+    uint16_t interval = (kmh >= g_config.speed_slow_threshold)
                         ? g_config.speed_slow_interval_ms
                         : g_config.speed_text_interval_ms;
+    if (interval < 25) interval = 25;
     if (last_text_update != 0 && now - last_text_update < interval) return;
+
+    if (kmh == displayed_speed) {
+        last_text_update = now;
+        return;
+    }
 
     int diff = (int)kmh - (int)displayed_speed;
     if (diff < 0) diff = -diff;
@@ -386,7 +417,12 @@ void dashboard_set_speed(uint16_t kmh) {
     last_text_update = now;
     displayed_speed = kmh;
     if (objects.speed && lv_obj_is_valid(objects.speed)) {
-        lv_label_set_text_fmt(objects.speed, "%d", kmh);
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%u", (unsigned)kmh);
+        const char *cur = lv_label_get_text(objects.speed);
+        if (cur == NULL || strcmp(cur, buf) != 0) {
+            lv_label_set_text(objects.speed, buf);
+        }
     }
 }
 
@@ -476,11 +512,77 @@ static void fuel_anim_completed_cb(lv_anim_t *a) {
     fuel_anim_running = false;
 }
 
+void dashboard_restore_fuel_from_nvs(uint8_t pct)
+{
+    if (pct > 100)
+        return;
+    fuel_anim_running = false;
+    current_fuel = pct;
+    fuel_system.has_displayed_value = true;
+    fuel_system.displayed_value = pct;
+    fuel_system.buffer_count = 0;
+    fuel_system.state = FUEL_STATE_STOPPED;
+    fuel_system.hysteresis_count = 0;
+    fuel_system.hysteresis_direction = 0;
+    fuel_system.state_change_time = lv_tick_get();
+    fuel_system.last_sample_time = lv_tick_get();
+    fuel_display_current = (int16_t)pct;
+    fuel_anim_cb(NULL, pct);
+}
+
+uint8_t dashboard_get_fuel_persist_pct(void)
+{
+    if (fuel_display_current < 0 || fuel_display_current > 100)
+        return 255;
+    return (uint8_t)fuel_display_current;
+}
+
+void dashboard_fuel_invalidate_reading(void)
+{
+    fuel_anim_running = false;
+    fuel_display_current = -1;
+    current_fuel = 0;
+    fuel_warning_on = false;
+    s_fuel_nvs_cycles_since_save = 0;
+
+    memset(&fuel_system, 0, sizeof(fuel_system));
+    fuel_system.state = FUEL_STATE_FIRST_RUN;
+
+    if (objects.fuel_bar && lv_obj_is_valid(objects.fuel_bar)) {
+        lv_bar_set_value(objects.fuel_bar, 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(objects.fuel_bar, lv_color_hex(g_config.color_bar_bg), LV_PART_INDICATOR);
+    }
+    if (objects.fuel_mover && lv_obj_is_valid(objects.fuel_mover))
+        lv_obj_set_y(objects.fuel_mover, 90);
+    if (objects.fuel_value && lv_obj_is_valid(objects.fuel_value)) {
+        lv_label_set_text(objects.fuel_value, "- - -");
+        lv_obj_set_style_text_color(objects.fuel_value, lv_color_hex(0x808080), 0);
+    }
+    if (objects.fuel_icon && lv_obj_is_valid(objects.fuel_icon))
+        lv_obj_set_style_image_recolor(objects.fuel_icon, lv_color_hex(C_NORM), 0);
+    if (objects.fuel_indicator && lv_obj_is_valid(objects.fuel_indicator))
+        lv_obj_set_style_line_color(objects.fuel_indicator, lv_color_hex(C_NORM), 0);
+}
+
+/** NVS: one cycle = fuel gauge actually starts moving to a new % (not skipped / same value / busy). */
+static void fuel_nvs_on_gauge_anim_started(uint8_t new_pct)
+{
+    uint16_t n = g_config.fuel_nvs_save_cycles;
+    if (n == 0 || !fuel_system.has_displayed_value)
+        return;
+    s_fuel_nvs_cycles_since_save++;
+    if (s_fuel_nvs_cycles_since_save >= n) {
+        s_fuel_nvs_cycles_since_save = 0;
+        if (new_pct <= 100)
+            hal_nvs_save_last_fuel_pct(new_pct);
+    }
+}
+
 void dashboard_set_fuel(uint8_t percent) {
     if (percent > 100) percent = 100;
     current_fuel = percent;  // Store for fuel warning logic
     
-    // First time - animate from 0
+    // First time with no NVS restore — paint0 then animate (restore sets fuel_display_current >= 0)
     if (fuel_display_current < 0) {
         fuel_display_current = 0;
         fuel_anim_cb(NULL, 0);
@@ -492,6 +594,8 @@ void dashboard_set_fuel(uint8_t percent) {
     
     // If animation running - skip (don't interrupt)
     if (fuel_anim_running) return;
+
+    fuel_nvs_on_gauge_anim_started(percent);
     
     // Start animation
     fuel_anim_running = true;
@@ -784,6 +888,19 @@ void dashboard_set_odometer(uint32_t km) {
     lv_label_set_text_fmt(objects.odometer, "%lu KM", km);
 }
 
+void dashboard_set_sensor_error(uint8_t channel, bool error) {
+    lv_obj_t *label = NULL;
+    if (channel == 0) label = objects.voltage;
+    else if (channel == 1) label = objects.fuel_value;
+    else if (channel == 2) label = objects.temp_status;
+    if (!label || !lv_obj_is_valid(label)) return;
+
+    if (error) {
+        lv_label_set_text(label, "ERROR");
+        lv_obj_set_style_text_color(label, lv_color_hex(C_RED), 0);
+    }
+}
+
 // Helper function for indicator icons
 static void set_indicator_icon(lv_obj_t *obj, bool on, uint32_t color_on) {
     if (on) {
@@ -799,20 +916,12 @@ void dashboard_set_turn_left(bool on) {
     if (dis_blinker_l) return;
     if (!objects.blinker_l || !lv_obj_is_valid(objects.blinker_l)) return;
     set_indicator_icon(objects.blinker_l, on, C_GRN);
-    if (objects.blinker_l_gradient && lv_obj_is_valid(objects.blinker_l_gradient)) {
-        if (on) lv_obj_clear_flag(objects.blinker_l_gradient, LV_OBJ_FLAG_HIDDEN);
-        else    lv_obj_add_flag(objects.blinker_l_gradient, LV_OBJ_FLAG_HIDDEN);
-    }
 }
 
 void dashboard_set_turn_right(bool on) {
     if (dis_blinker_r) return;
     if (!objects.blinker_r || !lv_obj_is_valid(objects.blinker_r)) return;
     set_indicator_icon(objects.blinker_r, on, C_GRN);
-    if (objects.blinker_r_gradient && lv_obj_is_valid(objects.blinker_r_gradient)) {
-        if (on) lv_obj_clear_flag(objects.blinker_r_gradient, LV_OBJ_FLAG_HIDDEN);
-        else    lv_obj_add_flag(objects.blinker_r_gradient, LV_OBJ_FLAG_HIDDEN);
-    }
 }
 
 void dashboard_set_high_beam(bool on) {
@@ -971,6 +1080,7 @@ void dashboard_hide_warning(void) {
 // ============================================================================
 // FUEL SMOOTHING SYSTEM IMPLEMENTATION
 // ============================================================================
+
 static void fuel_system_process(uint8_t raw_fuel, uint16_t speed) {
     uint32_t now = lv_tick_get();
     
@@ -1032,14 +1142,13 @@ static void fuel_system_process(uint8_t raw_fuel, uint16_t speed) {
     }
     
     // Check if it's time to take a sample
-    // For FIRST_RUN, take sample every call (ignore interval)
+    // For FIRST_RUN, should_sample is always true so every ADC fuel reading is used.
     bool should_sample = (fuel_system.state == FUEL_STATE_FIRST_RUN) || 
                          (now - fuel_system.last_sample_time >= sample_interval);
     
     if (should_sample) {
         fuel_system.last_sample_time = now;
         
-        // Add sample to buffer
         uint8_t buf_sz = g_config.fuel_buf_size;
         if (buf_sz < 2) buf_sz = 2;
         if (buf_sz > FUEL_BUFFER_MAX) buf_sz = FUEL_BUFFER_MAX;
@@ -1253,9 +1362,9 @@ static void dashboard_timer_cb(lv_timer_t *timer) {
             if (overheating_active) {
                 warning_set(WARNING_OVERHEATING, false);
                 overheating_active = false;
-                if (objects.temp_status && lv_obj_is_valid(objects.temp_status)) {
-                    lv_obj_set_style_text_opa(objects.temp_status, 255, 0);
-                }
+            }
+            if (objects.temp_status && lv_obj_is_valid(objects.temp_status)) {
+                lv_obj_set_style_text_opa(objects.temp_status, 255, 0);
             }
             overheating_start = 0;
         }

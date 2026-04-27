@@ -1,6 +1,6 @@
 #include "images.h"
 
-const ext_img_desc_t images[18] = {
+const ext_img_desc_t images[16] = {
     { "icon_battery", &img_icon_battery },
     { "icon_brake", &img_icon_brake },
     { "icon_foglight", &img_icon_foglight },
@@ -16,7 +16,5 @@ const ext_img_desc_t images[18] = {
     { "temp_indicator", &img_temp_indicator },
     { "glowplug_notification", &img_glowplug_notification },
     { "led", &img_led },
-    { "pointgrid", &img_pointgrid },
     { "icon_wifi", &img_icon_wifi },
-    { "speedogrid", &img_speedogrid },
 };

@@ -20,6 +20,7 @@
 #include "hal_tach.h"
 #include "hal_wifi.h"
 #include "dashboard.h"
+#include "screens.h"
 
 static const char *TAG = "boot";
 
@@ -87,9 +88,12 @@ void app_main(void)
              gpio_get_level(8), gpio_get_level(9));
 
     // === Non-critical init ===
+    int64_t adc_conv_start_us = 0;
     hal_adc_init(hal_i2c_get_bus());
-    if (g_config.adc_voltage_ch != 255)
+    if (g_config.adc_voltage_ch != 255) {
         hal_adc_start_conversion(g_config.adc_voltage_ch);
+        adc_conv_start_us = esp_timer_get_time();
+    }
 
     // Stop all log output so UART0 TX releases GPIO43/44 for speed/tach
     esp_log_level_set("*", ESP_LOG_NONE);
@@ -106,8 +110,14 @@ void app_main(void)
     if (hal_display_lock(100)) {
         dashboard_set_speed(0);
         dashboard_set_rpm(0);
+        uint8_t saved_fuel = 0;
+        if (hal_nvs_load_last_fuel_pct(&saved_fuel))
+            dashboard_restore_fuel_from_nvs(saved_fuel);
         hal_display_unlock();
     }
+
+    int64_t fuel_boot_ref_us = esp_timer_get_time();
+    static bool s_fuel_adc_seen = false;
     
     // === Main loop ===
     bool prev_left = false, prev_right = false;
@@ -124,9 +134,13 @@ void app_main(void)
 
     // ADC channel rotation: 0 = voltage (AIN2), 1 = fuel (AIN0), 2 = temp (AIN1)
     uint8_t adc_phase = 0;
+    #define ADC_TIMEOUT_US   (50 * 1000LL)
+    #define ADC_ERR_THRESH   5
+    uint8_t adc_err_cnt[3] = {0, 0, 0};
+    bool adc_err_shown[3] = {false, false, false};
 
-    bool fuel_config_dirty = false;
-    uint8_t adc_settle[3] = {0, 0, 0};
+    #define ADC_SETTLE_READS 4
+    uint8_t adc_sub_settle = 0;
     live_sensors_t sensors = {0};
 
     while (1) {
@@ -149,6 +163,20 @@ void app_main(void)
         // --- Ignition & delayed shutdown ---
         bool ignition = PIN_READ(g_config.pin_ignition, true);
 
+        if (g_config.fuel_no_read_timeout_ms > 0 && !s_fuel_adc_seen) {
+            if (now_us - fuel_boot_ref_us >= (int64_t)g_config.fuel_no_read_timeout_ms * 1000) {
+                static bool s_fuel_boot_stale_done;
+                if (!s_fuel_boot_stale_done) {
+                    s_fuel_boot_stale_done = true;
+                    hal_nvs_erase_last_fuel_pct();
+                    if (hal_display_lock(10)) {
+                        dashboard_fuel_invalidate_reading();
+                        hal_display_unlock();
+                    }
+                }
+            }
+        }
+
         if (!ignition) {
             if (shutdown_at == 0 && shutdown_attempts < 2) {
                 shutdown_at = now_us + SHUTDOWN_DELAY_US;
@@ -157,7 +185,15 @@ void app_main(void)
                 shutdown_attempts++;
                 ESP_LOGW(TAG, "Saving data and powering off (attempt %d)...", shutdown_attempts);
                 hal_nvs_save_odometer(g_odometer_km);
-                if (fuel_config_dirty) hal_nvs_save_config();
+                {
+                    uint8_t fp = 255;
+                    if (hal_display_lock(100)) {
+                        fp = dashboard_get_fuel_persist_pct();
+                        hal_display_unlock();
+                    }
+                    if (fp <= 100)
+                        hal_nvs_save_last_fuel_pct(fp);
+                }
                 vTaskDelay(pdMS_TO_TICKS(50));
                 gpio_set_level(POWER_HOLD_PIN, 0);
                 vTaskDelay(pdMS_TO_TICKS(1000));
@@ -237,13 +273,9 @@ void app_main(void)
             hal_display_unlock();
         }
 
-        if (speed_kmh == 0) {
-            hal_speed_reset_distance();
-        }
         uint32_t dist_m = hal_speed_get_distance_m();
-        if (speed_kmh > 0 && dist_m >= 100) {
-            g_odometer_km += dist_m / 1000;
-            hal_nvs_save_meters(dist_m);
+        if (dist_m > 0) {
+            g_odometer_km = hal_nvs_add_distance_m(dist_m);
             hal_speed_reset_distance();
             if (hal_display_lock(10)) {
                 dashboard_set_odometer(g_odometer_km);
@@ -280,85 +312,103 @@ void app_main(void)
                                 g_config.adc_temp_ch};
 
         float v_adc = 0.0f;
-        if (adc_ch_map[adc_phase] != 255 && hal_adc_read_raw(&v_adc)) {
-            if (adc_settle[adc_phase] < 2) {
-                adc_settle[adc_phase]++;
-            } else if (adc_phase == 0) {
-                float voltage = v_adc * g_config.voltage_multiplier;
-                sensors.voltage = voltage;
-                if (voltage >= 5.0f && voltage <= 24.0f) {
-                    hal_display_set_voltage_valid(true, voltage);
-                }
-            } else if (adc_phase == 1) {
-                float empty_v = (g_config.fuel_learned_empty_v > 0) ?
-                                 g_config.fuel_learned_empty_v : g_config.fuel_empty_v;
-                float full_v  = (g_config.fuel_learned_full_v > 0) ?
-                                 g_config.fuel_learned_full_v : g_config.fuel_full_v;
-
-                if (speed_kmh > 0) {
-                    if (v_adc > empty_v) {
-                        g_config.fuel_learned_empty_v = v_adc;
-                        empty_v = v_adc;
-                        fuel_config_dirty = true;
-                        ESP_LOGW("fuel", "Learned EMPTY: %.3fV", v_adc);
-                    } else if (v_adc < full_v) {
-                        g_config.fuel_learned_full_v = v_adc;
-                        full_v = v_adc;
-                        fuel_config_dirty = true;
-                        ESP_LOGW("fuel", "Learned FULL: %.3fV", v_adc);
-                    }
-                }
-
-                float range = empty_v - full_v;
-                uint8_t fuel_pct = 0;
-                if (range > 0.001f) {
-                    float t = (empty_v - v_adc) / range;
-                    if (t < 0.0f) t = 0.0f;
-                    if (t > 1.0f) t = 1.0f;
-                    fuel_pct = (uint8_t)(t * 100.0f + 0.5f);
-                }
-
-                sensors.fuel_v = v_adc;
-                sensors.fuel_pct = fuel_pct;
-
+        bool adc_read_ok = (adc_ch_map[adc_phase] != 255 && hal_adc_read_raw(&v_adc));
+        bool adc_timed_out = (!adc_read_ok && adc_conv_start_us > 0
+                              && (now_us - adc_conv_start_us) > ADC_TIMEOUT_US);
+        if (adc_read_ok) {
+            if (adc_err_shown[adc_phase]) {
+                adc_err_shown[adc_phase] = false;
+            }
+            adc_err_cnt[adc_phase] = 0;
+        }
+        if (adc_timed_out) {
+            if (adc_err_cnt[adc_phase] < 255) adc_err_cnt[adc_phase]++;
+            if (adc_err_cnt[adc_phase] >= ADC_ERR_THRESH && !adc_err_shown[adc_phase]) {
+                adc_err_shown[adc_phase] = true;
                 if (hal_display_lock(10)) {
-                    dashboard_feed_fuel(fuel_pct, speed_kmh);
+                    dashboard_set_sensor_error(adc_phase, true);
                     hal_display_unlock();
-                }
-            } else {
-                if (v_adc > 0.01f && v_adc < (TEMP_VREF - 0.01f)
-                    && g_config.temp_r_nominal > 0.1f
-                    && g_config.temp_beta > 0.1f) {
-                    float r_ntc = TEMP_PULLUP_OHM * v_adc / (TEMP_VREF - v_adc);
-                    float t_k = 1.0f / (1.0f / 298.15f +
-                                logf(r_ntc / g_config.temp_r_nominal) / g_config.temp_beta);
-                    float t_c = t_k - 273.15f;
-                    if (t_c != t_c) t_c = 0.0f; // NaN guard
-
-                    float range_c = g_config.temp_max_c - g_config.temp_min_c;
-                    float pct = (range_c > 0.1f) ?
-                        (t_c - g_config.temp_min_c) * 100.0f / range_c : 50.0f;
-                    if (pct < 0.0f) pct = 0.0f;
-                    if (pct > 100.0f) pct = 100.0f;
-
-                    sensors.temp_c = t_c;
-                    sensors.temp_pct = (uint8_t)(pct + 0.5f);
-
-                    if (hal_display_lock(10)) {
-                        dashboard_feed_temp(sensors.temp_pct);
-                        hal_display_unlock();
-                    }
                 }
             }
         }
+        if (adc_read_ok) {
+            if (adc_sub_settle < ADC_SETTLE_READS) {
+                adc_sub_settle++;
+                hal_adc_start_conversion(adc_ch_map[adc_phase]);
+                adc_conv_start_us = now_us;
+            } else {
+                if (adc_phase == 0) {
+                    float voltage = v_adc * g_config.voltage_multiplier;
+                    sensors.voltage = voltage;
+                    if (voltage >= 5.0f && voltage <= 24.0f) {
+                        hal_display_set_voltage_valid(true, voltage);
+                    }
+                } else if (adc_phase == 1) {
+                    float empty_v = g_config.fuel_empty_v;
+                    float full_v  = g_config.fuel_full_v;
+                    float range = empty_v - full_v;
+                    uint8_t fuel_pct = 0;
+                    if (range > 0.001f) {
+                        float t = (empty_v - v_adc) / range;
+                        if (t < 0.0f) t = 0.0f;
+                        if (t > 1.0f) t = 1.0f;
+                        fuel_pct = (uint8_t)(t * 100.0f + 0.5f);
+                    }
 
-        // Advance to next enabled channel
-        for (int i = 0; i < 3; i++) {
-            adc_phase = (adc_phase + 1) % 3;
-            if (adc_ch_map[adc_phase] != 255) break;
-        }
-        if (adc_ch_map[adc_phase] != 255) {
-            hal_adc_start_conversion(adc_ch_map[adc_phase]);
+                    sensors.fuel_v = v_adc;
+                    sensors.fuel_pct = fuel_pct;
+
+                    if (hal_display_lock(10)) {
+                        dashboard_feed_fuel(fuel_pct, speed_kmh);
+                        s_fuel_adc_seen = true;
+                        hal_display_unlock();
+                    }
+                } else {
+                    if (v_adc > 0.01f && v_adc < (TEMP_VREF - 0.01f)
+                        && g_config.temp_r_nominal > 0.1f
+                        && g_config.temp_beta > 0.1f) {
+                        float r_ntc = TEMP_PULLUP_OHM * v_adc / (TEMP_VREF - v_adc);
+                        float t_k = 1.0f / (1.0f / 298.15f +
+                                    logf(r_ntc / g_config.temp_r_nominal) / g_config.temp_beta);
+                        float t_c = t_k - 273.15f;
+                        if (t_c != t_c) t_c = 0.0f; // NaN guard
+
+                        float range_c = g_config.temp_max_c - g_config.temp_min_c;
+                        float pct = (range_c > 0.1f) ?
+                            (t_c - g_config.temp_min_c) * 100.0f / range_c : 50.0f;
+                        if (pct < 0.0f) pct = 0.0f;
+                        if (pct > 100.0f) pct = 100.0f;
+
+                        sensors.temp_c = t_c;
+                        sensors.temp_pct = (uint8_t)(pct + 0.5f);
+
+                        if (hal_display_lock(10)) {
+                            dashboard_feed_temp(sensors.temp_pct);
+                            hal_display_unlock();
+                        }
+                    }
+                }
+
+                adc_sub_settle = 0;
+                for (int i = 0; i < 3; i++) {
+                    adc_phase = (adc_phase + 1) % 3;
+                    if (adc_ch_map[adc_phase] != 255) break;
+                }
+                if (adc_ch_map[adc_phase] != 255) {
+                    hal_adc_start_conversion(adc_ch_map[adc_phase]);
+                    adc_conv_start_us = now_us;
+                }
+            }
+        } else if (adc_timed_out) {
+            adc_sub_settle = 0;
+            for (int i = 0; i < 3; i++) {
+                adc_phase = (adc_phase + 1) % 3;
+                if (adc_ch_map[adc_phase] != 255) break;
+            }
+            if (adc_ch_map[adc_phase] != 255) {
+                hal_adc_start_conversion(adc_ch_map[adc_phase]);
+                adc_conv_start_us = now_us;
+            }
         }
 
         // --- Auto-brightness (every 500ms) ---

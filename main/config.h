@@ -4,7 +4,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define CONFIG_VERSION 14
+#define CONFIG_VERSION 21
+
+/** Default VSS / Hall pulses per km for this cluster + vehicle (recalibrate with GPS if needed). */
+#define CONFIG_DEFAULT_PULSES_PER_KM  2160u
 
 typedef struct {
     uint16_t version;
@@ -34,8 +37,6 @@ typedef struct {
     // Fuel gauge calibration
     float fuel_empty_v;             // ADC voltage at empty  (default 1.15)
     float fuel_full_v;              // ADC voltage at full   (default 0.13)
-    float fuel_learned_empty_v;     // self-calibrated empty (default -1 = not learned)
-    float fuel_learned_full_v;      // self-calibrated full  (default -1 = not learned)
     uint8_t fuel_emergency_pct;     // low-fuel warning %    (default 25)
     uint8_t fuel_warn_on_pct;       // show Low Fuel below   (default 10)
     uint8_t fuel_warn_off_pct;      // hide Low Fuel above   (default 15)
@@ -48,6 +49,8 @@ typedef struct {
     uint16_t fuel_emergency_time_ms;// emergency override time (default 30000)
     uint8_t fuel_hyst_threshold;    // hysteresis % (default 1)
     uint8_t fuel_hyst_cycles;       // confirmation cycles (default 3)
+    uint16_t fuel_nvs_save_cycles;     // NVS every N fuel *gauge* updates (new target animated); 0 = shutdown only
+    uint32_t fuel_no_read_timeout_ms;   // after boot: no fuel ADC reading by this time → "---" + erase NVS; 0 = off
 
     // Temperature sensor calibration
     float temp_beta;                // NTC beta coefficient  (default 3435)
@@ -78,16 +81,17 @@ typedef struct {
     uint16_t blink_off_ms;          // hidden phase          (default 500)
 
     // Speed sensor
-    uint16_t pulses_per_km;         // VSS pulses per km     (default 539)
+    uint16_t pulses_per_km;         // VSS pulses per km     (default CONFIG_DEFAULT_PULSES_PER_KM)
     uint16_t speed_max_kmh;         // arc max speed         (default 180)
-    uint16_t speed_text_interval_ms;// label update interval (default 500)
-    uint16_t speed_slow_threshold;  // below this → slower   (default 10)
-    uint16_t speed_slow_interval_ms;// interval below thresh (default 1000)
     uint8_t speed_text_hyst;        // label hysteresis km/h (default 2)
+    uint16_t speed_text_interval_ms;// label update at normal speed (default 500)
+    uint16_t speed_slow_interval_ms;// label update at low speed (default 1000)
+    uint16_t speed_slow_threshold;  // below this km/h use slow interval (default 10)
     float speed_arc_smooth;         // arc EMA alpha 0-1     (default 0.4)
-    uint8_t speed_filter_size;      // median filter depth 1-9 (default 5)
-    uint8_t speed_max_accel;        // max km/h per second, 0=off (default 30)
-    uint8_t speed_confirm_count;    // consecutive samples to override (default 3)
+    uint16_t speed_glitch_ns;       // PCNT HW glitch filter (default 1000, max ~12800)
+    uint32_t speed_min_period_us;   // SW debounce min pulse gap in µs (default 1500; use uint32 — was uint16, max 65535)
+    uint16_t speed_window_ms;       // counting window       (default 500)
+    uint16_t speed_stopped_ms;      // no-pulse timeout      (default 2000)
 
     // Tachometer
     uint8_t tach_enabled;           // 0=off, 1=on           (default 0)
@@ -113,7 +117,7 @@ typedef struct {
     uint32_t color_wifi_connected;  // WiFi client connected    (default 0x00FF00)
     uint32_t color_wifi_off;        // WiFi off                 (default 0x080808)
     uint32_t color_bar_bg;          // fuel/temp bar background (default 0x080808)
-    uint32_t color_speedo_bg;       // speedo grid tint         (default 0x1E1E1E)
+    uint32_t color_speedo_bg;       // speedo arc background    (default 0x1E1E1E)
     uint32_t color_speedo_ind;      // speedo arc indicator     (default 0xFFFFFF)
 
     // Input pin mapping (MCP23017 bit 0-15, 255 = disabled)
@@ -131,6 +135,9 @@ typedef struct {
     uint8_t adc_fuel_ch;            // default 0  (AIN0)
     uint8_t adc_temp_ch;            // default 1  (AIN1)
 
+    // I2C (shared bus: MCP23017, BH1750, IO expander, ADS1115)
+    uint32_t i2c_scl_hz;           // SCL clock (default 100000; typical 400000 fast mode)
+
     // WiFi
     uint8_t wifi_start_delay_s;     // seconds after boot        (default 10)
     uint8_t wifi_idle_timeout_s;    // auto-off if no client     (default 60)
@@ -142,5 +149,6 @@ typedef struct {
 extern dashboard_config_t g_config;
 
 void config_set_defaults(dashboard_config_t *cfg);
+void config_sanitize(dashboard_config_t *cfg);
 
 #endif

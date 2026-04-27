@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "main.c"
+        "config_json.c"
         "hal/hal_display.c"
         "hal/hal_i2c.c"
         "hal/hal_adc.c"
@@ -8,6 +9,7 @@ idf_component_register(
         "hal/hal_speed.c"
         "hal/hal_tach.c"
         "hal/hal_wifi.c"
+        "hal/hal_ota.c"
         "ui_port/screens.c"
         "ui_port/ui.c"
         "ui_port/images.c"
@@ -16,7 +18,6 @@ idf_component_register(
         "ui_port/ui_font_eurostile_bold_95w_large.c"
         "ui_port/ui_font_eurostile_bold_95w_medium.c"
         "ui_port/ui_font_eurostile_bold_95w_small.c"
-        "ui_port/ui_image_pointgrid.c"
         "ui_port/ui_image_icon_battery.c"
         "ui_port/ui_image_icon_blinker_l.c"
         "ui_port/ui_image_icon_blinker_r.c"
@@ -30,13 +31,11 @@ idf_component_register(
         "ui_port/ui_image_icon_temp.c"
         "ui_port/ui_image_icon_warning.c"
         "ui_port/ui_image_speedmask.c"
-        "ui_port/ui_image_speedogrid.c"
         "ui_port/ui_image_led.c"
         "ui_port/ui_image_temp_indicator.c"
         "ui_port/ui_image_glowplug_notification.c"
         "ui_port/ui_image_arrow_l.c"
         "ui_port/ui_image_icon_breake.c"
-        "ui_port/ui_image_speed_mask.c"
         "ui_port/ui_image_warning.c"
     INCLUDE_DIRS
         "."
@@ -47,13 +46,15 @@ idf_component_register(
         esp_mm
         esp_driver_gpio
         esp_driver_i2c
+        esp_driver_pcnt
         esp_timer
         nvs_flash
         driver
         lvgl
         esp_wifi
         esp_http_server
+        app_update
         esp_netif
         esp_event
-        json
+        cjson
 )

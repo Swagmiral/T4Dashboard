@@ -10,14 +10,18 @@
  *   GET  /config    — current g_config + odometer as JSON
  *   POST /config    — update g_config (+ optional odometer) from JSON, save to NVS
  *   POST /reset     — restore defaults, save to NVS
+ *   GET  /ota       — OTA instructions (plain text)
+ *   POST /ota       — firmware OTA (raw .bin body, Content-Length required)
  *   GET  *          — captive portal redirect (any other path)
  */
 
 #include "hal_wifi.h"
 #include "config.h"
+#include "config_json.h"
 #include "hal_nvs.h"
 #include "hal_i2c.h"
 #include "hal_speed.h"
+#include "hal_ota.h"
 #include "driver/gpio.h"
 
 #include "esp_wifi.h"
@@ -30,7 +34,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
-#include <math.h>
 
 #define AP_SSID_DEFAULT "Dr.Agon"
 #define AP_PASS_DEFAULT "cykablyat"
@@ -47,8 +50,6 @@ static volatile uint16_t sim_flags = 0;
 static httpd_handle_t s_server = NULL;
 static volatile int dns_sock = -1;
 static TaskHandle_t dns_task_handle = NULL;
-
-extern volatile uint32_t g_odometer_km;
 
 static live_sensors_t s_sensors;
 
@@ -103,7 +104,8 @@ static const char config_html[] =
 ".tg.on{background:#ff9800}"
 ".tg::after{content:'';position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:#aaa;transition:transform .2s,background .2s}"
 ".tg.on::after{transform:translateX(20px);background:#fff}"
-".btns{margin:16px 0;display:flex;gap:8px}"
+".btns{margin:16px 0 6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}"
+".save-hint{flex:1 1 100%;margin:0 0 8px;font-size:.72em;color:#888;line-height:1.35}"
 ".btns button{flex:1;padding:12px;border:none;border-radius:6px;font-size:.9em;font-weight:600;cursor:pointer}"
 "#saveBtn{background:#ff9800;color:#000}"
 "#saveBtn:active{background:#e68a00}"
@@ -125,100 +127,110 @@ static const char config_html[] =
 "<div class='btns'>"
 "<button id='saveBtn' onclick='save()'>Save</button>"
 "<button id='resetBtn' onclick='reset()'>Reset Defaults</button>"
+"<p class='save-hint'>After Save, cycle ignition (full power off/on) if something still looks wrong — settings apply from NVS on boot.</p>"
 "</div>"
 "<div class='btns2'>"
 "<button id='dlBtn' onclick='backup()'>Download Backup</button>"
 "<label class='rlbl'>Restore Backup<input type='file' accept='.json' onchange='restore(this)'></label>"
 "</div>"
+"<p style='font-size:.72em;color:#777;margin:10px 0;line-height:1.35'>"
+"<b>OTA firmware:</b> open <code>GET /ota</code> for help. Example: "
+"<code>curl -T t4dashboard.bin http://192.168.4.1/ota</code>"
+"</p>"
 "<script>"
 "var F=["
 "['Odometer',["
-"['odometer_km','Odometer (km)',0,'i']"
+"['odometer_km','Odometer (km)',0,'i','Total distance driven. Saved to NVS with wear leveling.']"
 "]],"
 "['Voltage',["
-"['voltage_multiplier','Divider ratio',5.02,'f'],"
-"['voltage_ema_alpha','EMA alpha',0.03,'f'],"
-"['voltage_settle_count','Settle samples',8,'i'],"
-"['voltage_display_hyst','Display hysteresis (V)',0.07,'f']"
+"['voltage_multiplier','Divider ratio',5.02,'f','Resistor divider ratio for battery voltage measurement via ADS1115.'],"
+"['voltage_ema_alpha','EMA alpha',0.03,'f','Exponential moving average smoothing. Lower = smoother, slower response.'],"
+"['voltage_settle_count','Settle samples',8,'i','Number of ADC readings to skip after boot before displaying.'],"
+"['voltage_display_hyst','Display hysteresis (V)',0.07,'f','Minimum voltage change to update the display value.']"
 "]],"
 "['Voltage Thresholds',["
-"['color_red_enter_v','Red enter (V)',11.3,'f'],"
-"['color_red_exit_v','Red exit (V)',11.5,'f'],"
-"['color_yellow_enter_v','Yellow enter (V)',15.2,'f'],"
-"['color_yellow_exit_v','Yellow exit (V)',14.8,'f']"
+"['color_red_enter_v','Red enter (V)',11.3,'f','Voltage label turns red below this.'],"
+"['color_red_exit_v','Red exit (V)',11.5,'f','Voltage label returns to normal above this.'],"
+"['color_yellow_enter_v','Yellow enter (V)',15.2,'f','Voltage label turns yellow above this (overcharging).'],"
+"['color_yellow_exit_v','Yellow exit (V)',14.8,'f','Voltage label returns to normal below this.']"
 "]],"
 "['Voltage Warnings',["
-"['warn_low_enter_v','Low trigger (V)',11.0,'f'],"
-"['warn_low_exit_v','Low clear (V)',11.4,'f'],"
-"['warn_low_enter_ms','Low delay (ms)',8000,'i'],"
-"['warn_low_exit_ms','Low clear delay (ms)',3000,'i'],"
-"['warn_high_enter_v','High trigger (V)',15.2,'f'],"
-"['warn_high_exit_v','High clear (V)',14.8,'f'],"
-"['warn_high_enter_ms','High delay (ms)',5000,'i'],"
-"['warn_high_exit_ms','High clear delay (ms)',3000,'i']"
+"['warn_low_enter_v','Low trigger (V)',11.0,'f','Battery warning icon appears below this voltage.'],"
+"['warn_low_exit_v','Low clear (V)',11.4,'f','Battery warning icon hides above this voltage.'],"
+"['warn_low_enter_ms','Low delay (ms)',8000,'i','Voltage must stay below trigger for this long before warning activates.'],"
+"['warn_low_exit_ms','Low clear delay (ms)',3000,'i','Voltage must stay above clear for this long before warning deactivates.'],"
+"['warn_high_enter_v','High trigger (V)',15.2,'f','Overvoltage warning activates above this.'],"
+"['warn_high_exit_v','High clear (V)',14.8,'f','Overvoltage warning clears below this.'],"
+"['warn_high_enter_ms','High delay (ms)',5000,'i','Overvoltage activation delay.'],"
+"['warn_high_exit_ms','High clear delay (ms)',3000,'i','Overvoltage deactivation delay.']"
 "]],"
 "['Fuel Calibration',["
-"['fuel_empty_v','Empty voltage',1.15,'f'],"
-"['fuel_full_v','Full voltage',0.13,'f'],"
-"['fuel_learned_empty_v','Learned empty (V)',-1,'r'],"
-"['fuel_learned_full_v','Learned full (V)',-1,'r'],"
-"['fuel_emergency_pct','Emergency diff (%)',25,'i'],"
-"['fuel_warn_on_pct','Low fuel warn ON (%)',10,'i'],"
-"['fuel_warn_off_pct','Low fuel warn OFF (%)',15,'i']"
+"['fuel_empty_v','Empty voltage',1.15,'f','ADS1115 voltage reading when tank is empty.'],"
+"['fuel_full_v','Full voltage',0.13,'f','ADS1115 voltage reading when tank is full.'],"
+"['fuel_emergency_pct','Emergency diff (%)',25,'i','Emergency fuel level detection threshold.'],"
+"['fuel_warn_on_pct','Low fuel warn ON (%)',10,'i','Low fuel warning icon appears below this percentage.'],"
+"['fuel_warn_off_pct','Low fuel warn OFF (%)',15,'i','Low fuel warning icon hides above this percentage.']"
 "]],"
 "['Fuel Sampling',["
-"['fuel_buf_size','Buffer size',20,'i','2 - 30'],"
-"['fuel_sample_moving_ms','Moving interval (ms)',2000,'i'],"
-"['fuel_sample_stopped_ms','Stopped interval (ms)',500,'i'],"
-"['fuel_stop_delay_ms','Stop detect delay (ms)',30000,'i'],"
-"['fuel_emergency_time_ms','Emergency time (ms)',30000,'i'],"
-"['fuel_hyst_threshold','Hysteresis (%)',1,'i'],"
-"['fuel_hyst_cycles','Confirm cycles',3,'i']"
+"['fuel_buf_size','Buffer size',20,'i','Averaging buffer size (2-30). More = smoother, slower response.'],"
+"['fuel_sample_moving_ms','Moving interval (ms)',2000,'i','How often to sample fuel level while driving.'],"
+"['fuel_sample_stopped_ms','Stopped interval (ms)',500,'i','How often to sample fuel level while stationary.'],"
+"['fuel_stop_delay_ms','Stop detect delay (ms)',30000,'i','Time after stopping before switching to stopped sampling rate.'],"
+"['fuel_emergency_time_ms','Emergency time (ms)',30000,'i','Override time for emergency fuel level changes.'],"
+"['fuel_hyst_threshold','Hysteresis (%)',1,'i','Minimum fuel % change before updating display.'],"
+"['fuel_hyst_cycles','Confirm cycles',3,'i','Consecutive readings needed to confirm a level change.'],"
+"['fuel_nvs_save_cycles','Flash save every N updates',10,'i','After every N fuel gauge updates (new %% animated, not raw samples), save that %% to NVS. Pattern: N updates → write → N updates → write. 0 = only on ignition-off shutdown.',0,5000],"
+"['fuel_no_read_timeout_ms','No-reading timeout (ms)',60000,'i','After boot: if no fuel ADC reading by then, show --- and erase stored fuel %. 0 = disabled.',0,86400000]"
 "]],"
 "['Temperature Sensor',["
-"['temp_beta','NTC beta',3435,'f'],"
-"['temp_r_nominal','R nominal (ohm)',2500,'f'],"
-"['temp_min_c','Gauge 0% (C)',40,'f'],"
-"['temp_max_c','Gauge 100% (C)',120,'f'],"
-"['temp_overheat_pct','Overheat warning (%)',80,'i'],"
-"['temp_overheat_delay_ms','Overheat delay (ms)',2000,'i']"
+"['temp_beta','NTC beta',3435,'f','Curve steepness. Higher = more spread between cold/hot. If cold is OK but hot reads wrong, adjust this.'],"
+"['temp_r_nominal','R nominal (ohm)',2500,'f','Baseline resistance at 25\\u00B0C. Lower = higher readings everywhere, higher = lower readings everywhere.'],"
+"['temp_min_c','Gauge 0% (\\u00B0C)',40,'f','Temperature mapped to 0% on the gauge bar.'],"
+"['temp_max_c','Gauge 100% (\\u00B0C)',120,'f','Temperature mapped to 100% on the gauge bar.'],"
+"['temp_overheat_pct','Overheat warning (%)',80,'i','Overheat warning activates above this gauge percentage.'],"
+"['temp_overheat_delay_ms','Overheat delay (ms)',2000,'i','Temperature must stay above threshold for this long before warning.']"
 "]],"
 "['Temperature Display',["
-"['temp_cold_on_pct','Enter COLD (%)',30,'i'],"
-"['temp_cold_off_pct','Exit COLD (%)',33,'i'],"
-"['temp_hot_on_pct','Enter HOT (%)',70,'i'],"
-"['temp_hot_off_pct','Exit HOT (%)',67,'i'],"
-"['temp_display_hyst','Display hysteresis (%)',2,'i']"
+"['temp_cold_on_pct','Enter COLD (%)',30,'i','Below this gauge % the status shows COLD (blue).'],"
+"['temp_cold_off_pct','Exit COLD (%)',33,'i','Above this gauge % the status returns to OK from COLD.'],"
+"['temp_hot_on_pct','Enter HOT (%)',70,'i','Above this gauge % the status shows HOT (red).'],"
+"['temp_hot_off_pct','Exit HOT (%)',67,'i','Below this gauge % the status returns to OK from HOT.'],"
+"['temp_display_hyst','Display hysteresis (%)',2,'i','Minimum gauge % change before updating the bar position.']"
 "]],"
 "['Brightness',["
-"['light_ema_alpha','Light EMA alpha',0.15,'f'],"
-"['brightness_min','Min PWM',15,'i'],"
-"['brightness_max','Max PWM',255,'i'],"
-"['brightness_dark_lux','Dark threshold (lux)',0.2,'f'],"
-"['brightness_bright_lux','Bright threshold (lux)',0.7,'f'],"
-"['brightness_dark_pwm','Dark PWM',70,'i'],"
-"['brightness_bright_pwm','Bright PWM',150,'i']"
+"['light_ema_alpha','Light EMA alpha',0.15,'f','Smoothing for BH1750 light sensor readings.'],"
+"['brightness_min','Min PWM',15,'i','Absolute minimum backlight level (0-255). Never goes darker.'],"
+"['brightness_max','Max PWM',255,'i','Absolute maximum backlight level (0-255).'],"
+"['brightness_dark_lux','Dark threshold (lux)',0.2,'f','Below this lux level, backlight uses dark PWM value.'],"
+"['brightness_bright_lux','Bright threshold (lux)',0.7,'f','Above this lux level, backlight ramps toward max.'],"
+"['brightness_dark_pwm','Dark PWM',70,'i','Backlight PWM value in dark conditions.'],"
+"['brightness_bright_pwm','Bright PWM',150,'i','Backlight PWM value at bright threshold.']"
 "]],"
 "['Warning Blink',["
-"['blink_on_ms','On phase (ms)',1000,'i'],"
-"['blink_off_ms','Off phase (ms)',500,'i']"
+"['blink_on_ms','On phase (ms)',1000,'i','Duration warning icons stay visible during blink cycle.'],"
+"['blink_off_ms','Off phase (ms)',500,'i','Duration warning icons stay hidden during blink cycle.']"
 "]],"
-"['Speed',["
-"['pulses_per_km','Pulses per km',539,'i'],"
-"['speed_max_kmh','Arc max (km/h)',180,'i'],"
-"['speed_text_interval_ms','Label update (ms)',500,'i'],"
-"['speed_slow_threshold','Slow threshold (km/h)',10,'i'],"
-"['speed_slow_interval_ms','Slow update (ms)',1000,'i'],"
-"['speed_text_hyst','Label hysteresis (km/h)',2,'i'],"
-"['speed_arc_smooth','Arc smoothing (0-1)',0.4,'f'],"
-"['speed_filter_size','Median filter depth (1-9)',5,'i'],"
-"['speed_max_accel','Max accel (km/h/s, 0=off)',30,'i'],"
-"['speed_confirm_count','Confirm samples to override',3,'i']"
+"['Speed \\u2014 Measurement',["
+"['pulses_per_km','Pulses per km',2160,'i','Hall sensor pulses per 1 km. Default 2160 for this VSS; recalibrate with GPS if unsure.'],"
+"['speed_glitch_ns','HW glitch filter (ns)',1000,'i','PCNT hardware filter. Rejects pulses shorter than this. Max ~12800 ns.'],"
+"['speed_min_period_us','SW debounce (\\u00B5s)',1500,'i','Minimum gap between accepted pulses in microseconds (e.g. 150000 = 150 ms).',1,10000000],"
+"['speed_window_ms','Counting window (ms)',500,'i','Time window for pulse counting. Longer = smoother, shorter = more responsive.'],"
+"['speed_stopped_ms','Stopped timeout (ms)',2000,'i','Time without pulses before speed drops to 0.']"
+"]],"
+"['Speed \\u2014 Arc',["
+"['speed_max_kmh','Arc max (km/h)',180,'i','Maximum speed shown on the speedometer arc.'],"
+"['speed_arc_smooth','Arc smoothing (0-1)',0.4,'f','EMA alpha for arc animation. Lower = smoother but slower. 1.0 = instant.']"
+"]],"
+"['Speed \\u2014 Label',["
+"['speed_text_hyst','Label hysteresis (km/h)',2,'i','Speed label only updates when change exceeds this value. Reduces jitter.'],"
+"['speed_text_interval_ms','Low speed update (ms)',500,'i','Label update interval below the threshold. Lower = more responsive.',25],"
+"['speed_slow_interval_ms','High speed update (ms)',1000,'i','Label update interval above the threshold. Higher = more stable.',25],"
+"['speed_slow_threshold','Speed threshold (km/h)',100,'i','Speed above which the slower label update interval is used.']"
 "]],"
 "['Tachometer',["
-"['tach_enabled','Enabled',0,'i','0 = off, 1 = on'],"
-"['tach_pulses_per_rev','Pulses per revolution',1,'i'],"
-"['tach_max_rpm','Max RPM',6000,'i']"
+"['tach_enabled','Enabled',0,'i','0 = off, 1 = on. Uses alternator W terminal on GPIO44.'],"
+"['tach_pulses_per_rev','Pulses per revolution',1,'i','Pulses from alternator W terminal per engine revolution.'],"
+"['tach_max_rpm','Max RPM',6000,'i','Maximum RPM for the LED bar display range.']"
 "]],"
 "['Colors',["
 "['color_normal','Normal icons',0xFFFFFF,'c'],"
@@ -236,33 +248,36 @@ static const char config_html[] =
 "['color_wifi_connected','WiFi connected',0x00FF00,'c'],"
 "['color_wifi_off','WiFi off',0x080808,'c'],"
 "['color_bar_bg','Fuel/temp bar background',0x080808,'c'],"
-"['color_speedo_bg','Speedometer grid tint',0x1E1E1E,'c'],"
+"['color_speedo_bg','Speedometer arc background',0x1E1E1E,'c'],"
 "['color_speedo_ind','Speedometer arc',0xFFFFFF,'c']"
 "]],"
 "['Pin Mapping',["
-"['pin_ignition','Ignition',0,'i','255 = off (stays ON)'],"
-"['pin_blinker_l','Left blinker',6,'i','255 = off'],"
-"['pin_blinker_r','Right blinker',5,'i','255 = off'],"
-"['pin_high_beam','High beam',3,'i','255 = off'],"
-"['pin_glow_plug','Glow plug',4,'i','255 = off'],"
-"['pin_brake','Brake',255,'i','255 = off'],"
-"['pin_oil','Oil pressure',255,'i','255 = off'],"
-"['pin_fog_light','Fog light',255,'i','255 = off']"
+"['pin_ignition','Ignition',0,'i','MCP23017 bit (0-15). 255 = disabled (ignition always on).'],"
+"['pin_blinker_l','Left blinker',6,'i','MCP23017 bit (0-15). 255 = disabled.'],"
+"['pin_blinker_r','Right blinker',5,'i','MCP23017 bit (0-15). 255 = disabled.'],"
+"['pin_high_beam','High beam',3,'i','MCP23017 bit (0-15). 255 = disabled.'],"
+"['pin_glow_plug','Glow plug',4,'i','MCP23017 bit (0-15). 255 = disabled.'],"
+"['pin_brake','Brake',255,'i','MCP23017 bit (0-15). 255 = disabled.'],"
+"['pin_oil','Oil pressure',255,'i','MCP23017 bit (0-15). 255 = disabled.'],"
+"['pin_fog_light','Fog light',255,'i','MCP23017 bit (0-15). 255 = disabled.']"
 "]],"
 "['ADC Channels',["
-"['adc_voltage_ch','Voltage',2,'i','0-3, 255 = off'],"
-"['adc_fuel_ch','Fuel',0,'i','0-3, 255 = off'],"
-"['adc_temp_ch','Temperature',1,'i','0-3, 255 = off']"
+"['adc_voltage_ch','Voltage',2,'i','ADS1115 channel (0-3). 255 = disabled.'],"
+"['adc_fuel_ch','Fuel',0,'i','ADS1115 channel (0-3). 255 = disabled.'],"
+"['adc_temp_ch','Temperature',1,'i','ADS1115 channel (0-3). 255 = disabled.']"
+"]],"
+"['I2C',["
+"['i2c_scl_hz','SCL clock (Hz)',100000,'i','Shared bus (MCP23017, BH1750, backlight IC, ADS1115). 100000=standard, 400000=fast.',50000,1000000]"
 "]],"
 "['Power',["
-"['shutdown_delay_s','Turn-off delay (sec)',5,'i']"
+"['shutdown_delay_s','Turn-off delay (sec)',5,'i','Seconds to wait after ignition off before cutting MOSFET power latch.']"
 "]],"
 "['WiFi',["
-"['wifi_ssid','Network name','Dr.Agon','s'],"
-"['wifi_pass','Password','cykablyat','s','min 8 chars'],"
-"['wifi_start_delay_s','Start delay (sec)',10,'i'],"
-"['wifi_idle_timeout_s','No-connect timeout (sec)',60,'i','shutdown if nobody connects'],"
-"['wifi_active_timeout_s','Post-session timeout (sec)',600,'i','shutdown after last disconnect']"
+"['wifi_ssid','Network name','Dr.Agon','s','SoftAP SSID.'],"
+"['wifi_pass','Password','cykablyat','s','SoftAP password (min 8 chars).'],"
+"['wifi_start_delay_s','Start delay (sec)',10,'i','Seconds after boot before WiFi starts.'],"
+"['wifi_idle_timeout_s','No-connect timeout (sec)',60,'i','WiFi shuts down if nobody connects within this time.'],"
+"['wifi_active_timeout_s','Post-session timeout (sec)',600,'i','WiFi shuts down this many seconds after last client disconnects.']"
 "]],"
 "['Simulation',["
 "['sim_low_battery','Low Battery',0,'t'],"
@@ -313,7 +328,7 @@ static const char config_html[] =
 "}else{"
 "var tp=f[3]==='s'?'text':'number';"
 "h+='<input id=\"'+f[0]+'\" type=\"'+tp+'\"';"
-"if(tp==='number')h+=' step=\"any\"';"
+"if(tp==='number'){h+=' step=\"any\"';if(f[5]!=null)h+=' min=\"'+f[5]+'\"';if(f[6]!=null)h+=' max=\"'+f[6]+'\"';}"
 "if(ro)h+=' class=\"ro\" readonly';"
 "h+=' value=\"\">';"
 "if(!ro){D[f[0]]=f[2];"
@@ -383,307 +398,6 @@ static const char config_html[] =
 "</script></body></html>";
 
 /* ======================================================================== */
-/* JSON serialization                                                        */
-/* ======================================================================== */
-
-static void add_f2(cJSON *j, const char *name, float v)
-{
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%.2f", (double)v);
-    char *p = buf + strlen(buf) - 1;
-    while (p > buf && *p == '0') p--;
-    if (*p == '.') p--;
-    p[1] = '\0';
-    cJSON_AddItemToObject(j, name, cJSON_CreateRaw(buf));
-}
-
-#define ADD_F(j, name) add_f2(j, #name, g_config.name)
-#define ADD_I(j, name) cJSON_AddNumberToObject(j, #name, g_config.name)
-
-static char *config_to_json(void)
-{
-    cJSON *j = cJSON_CreateObject();
-    if (!j) return NULL;
-
-    cJSON_AddNumberToObject(j, "odometer_km", g_odometer_km);
-
-    ADD_F(j, voltage_multiplier);
-    ADD_F(j, voltage_ema_alpha);
-    ADD_I(j, voltage_settle_count);
-    ADD_F(j, voltage_display_hyst);
-
-    ADD_F(j, color_red_enter_v);
-    ADD_F(j, color_red_exit_v);
-    ADD_F(j, color_yellow_enter_v);
-    ADD_F(j, color_yellow_exit_v);
-
-    ADD_F(j, warn_low_enter_v);
-    ADD_F(j, warn_low_exit_v);
-    ADD_I(j, warn_low_enter_ms);
-    ADD_I(j, warn_low_exit_ms);
-    ADD_F(j, warn_high_enter_v);
-    ADD_F(j, warn_high_exit_v);
-    ADD_I(j, warn_high_enter_ms);
-    ADD_I(j, warn_high_exit_ms);
-
-    ADD_F(j, fuel_empty_v);
-    ADD_F(j, fuel_full_v);
-    ADD_F(j, fuel_learned_empty_v);
-    ADD_F(j, fuel_learned_full_v);
-    ADD_I(j, fuel_emergency_pct);
-    ADD_I(j, fuel_warn_on_pct);
-    ADD_I(j, fuel_warn_off_pct);
-
-    ADD_I(j, fuel_buf_size);
-    ADD_I(j, fuel_sample_moving_ms);
-    ADD_I(j, fuel_sample_stopped_ms);
-    ADD_I(j, fuel_stop_delay_ms);
-    ADD_I(j, fuel_emergency_time_ms);
-    ADD_I(j, fuel_hyst_threshold);
-    ADD_I(j, fuel_hyst_cycles);
-
-    ADD_F(j, temp_beta);
-    ADD_F(j, temp_r_nominal);
-    ADD_F(j, temp_min_c);
-    ADD_F(j, temp_max_c);
-    ADD_I(j, temp_overheat_pct);
-    ADD_I(j, temp_overheat_delay_ms);
-
-    ADD_I(j, temp_cold_on_pct);
-    ADD_I(j, temp_cold_off_pct);
-    ADD_I(j, temp_hot_on_pct);
-    ADD_I(j, temp_hot_off_pct);
-    ADD_I(j, temp_display_hyst);
-
-    ADD_F(j, light_ema_alpha);
-    ADD_I(j, brightness_min);
-    ADD_I(j, brightness_max);
-    ADD_F(j, brightness_dark_lux);
-    ADD_F(j, brightness_bright_lux);
-    ADD_I(j, brightness_dark_pwm);
-    ADD_I(j, brightness_bright_pwm);
-
-    ADD_I(j, blink_on_ms);
-    ADD_I(j, blink_off_ms);
-
-    ADD_I(j, pulses_per_km);
-    ADD_I(j, speed_max_kmh);
-    ADD_I(j, speed_text_interval_ms);
-    ADD_I(j, speed_slow_threshold);
-    ADD_I(j, speed_slow_interval_ms);
-    ADD_I(j, speed_text_hyst);
-    ADD_F(j, speed_arc_smooth);
-    ADD_I(j, speed_filter_size);
-    ADD_I(j, speed_max_accel);
-    ADD_I(j, speed_confirm_count);
-
-    ADD_I(j, tach_enabled);
-    ADD_I(j, tach_pulses_per_rev);
-    ADD_I(j, tach_max_rpm);
-
-    ADD_I(j, color_normal);
-    ADD_I(j, color_red);
-    ADD_I(j, color_green);
-    ADD_I(j, color_yellow);
-    ADD_I(j, color_cold);
-    ADD_I(j, color_high_beam);
-    ADD_I(j, color_glow_plug);
-    ADD_I(j, color_dim);
-    ADD_I(j, color_disabled);
-    ADD_I(j, color_temp_ok);
-    ADD_I(j, color_fog);
-    ADD_I(j, color_wifi_active);
-    ADD_I(j, color_wifi_connected);
-    ADD_I(j, color_wifi_off);
-    ADD_I(j, color_bar_bg);
-    ADD_I(j, color_speedo_bg);
-    ADD_I(j, color_speedo_ind);
-
-    ADD_I(j, pin_ignition);
-    ADD_I(j, pin_blinker_l);
-    ADD_I(j, pin_blinker_r);
-    ADD_I(j, pin_high_beam);
-    ADD_I(j, pin_glow_plug);
-    ADD_I(j, pin_brake);
-    ADD_I(j, pin_oil);
-    ADD_I(j, pin_fog_light);
-
-    ADD_I(j, adc_voltage_ch);
-    ADD_I(j, adc_fuel_ch);
-    ADD_I(j, adc_temp_ch);
-
-    ADD_I(j, shutdown_delay_s);
-
-    cJSON_AddStringToObject(j, "wifi_ssid", g_config.wifi_ssid);
-    cJSON_AddStringToObject(j, "wifi_pass", g_config.wifi_pass);
-    ADD_I(j, wifi_start_delay_s);
-    ADD_I(j, wifi_idle_timeout_s);
-    ADD_I(j, wifi_active_timeout_s);
-
-    char *str = cJSON_PrintUnformatted(j);
-    cJSON_Delete(j);
-    return str;
-}
-
-#define JSON_SET_FLOAT(name) do { \
-    cJSON *item = cJSON_GetObjectItem(j, #name); \
-    if (item && cJSON_IsNumber(item)) g_config.name = (float)item->valuedouble; \
-} while(0)
-
-#define JSON_SET_U8(name) do { \
-    cJSON *item = cJSON_GetObjectItem(j, #name); \
-    if (item && cJSON_IsNumber(item)) g_config.name = (uint8_t)item->valuedouble; \
-} while(0)
-
-#define JSON_SET_U16(name) do { \
-    cJSON *item = cJSON_GetObjectItem(j, #name); \
-    if (item && cJSON_IsNumber(item)) g_config.name = (uint16_t)item->valuedouble; \
-} while(0)
-
-#define JSON_SET_U32(name) do { \
-    cJSON *item = cJSON_GetObjectItem(j, #name); \
-    if (item && cJSON_IsNumber(item)) g_config.name = (uint32_t)item->valuedouble; \
-} while(0)
-
-static bool config_from_json(const char *buf)
-{
-    cJSON *j = cJSON_Parse(buf);
-    if (!j) return false;
-
-    // Odometer (optional — present in backups)
-    cJSON *odo = cJSON_GetObjectItem(j, "odometer_km");
-    if (odo && cJSON_IsNumber(odo)) {
-        uint32_t new_km = (uint32_t)odo->valuedouble;
-        g_odometer_km = new_km;
-        hal_nvs_save_odometer(new_km);
-    }
-
-    JSON_SET_FLOAT(voltage_multiplier);
-    JSON_SET_FLOAT(voltage_ema_alpha);
-    JSON_SET_U8(voltage_settle_count);
-    JSON_SET_FLOAT(voltage_display_hyst);
-
-    JSON_SET_FLOAT(color_red_enter_v);
-    JSON_SET_FLOAT(color_red_exit_v);
-    JSON_SET_FLOAT(color_yellow_enter_v);
-    JSON_SET_FLOAT(color_yellow_exit_v);
-
-    JSON_SET_FLOAT(warn_low_enter_v);
-    JSON_SET_FLOAT(warn_low_exit_v);
-    JSON_SET_U16(warn_low_enter_ms);
-    JSON_SET_U16(warn_low_exit_ms);
-    JSON_SET_FLOAT(warn_high_enter_v);
-    JSON_SET_FLOAT(warn_high_exit_v);
-    JSON_SET_U16(warn_high_enter_ms);
-    JSON_SET_U16(warn_high_exit_ms);
-
-    JSON_SET_FLOAT(fuel_empty_v);
-    JSON_SET_FLOAT(fuel_full_v);
-    JSON_SET_U8(fuel_emergency_pct);
-    JSON_SET_U8(fuel_warn_on_pct);
-    JSON_SET_U8(fuel_warn_off_pct);
-
-    JSON_SET_U8(fuel_buf_size);
-    JSON_SET_U16(fuel_sample_moving_ms);
-    JSON_SET_U16(fuel_sample_stopped_ms);
-    JSON_SET_U16(fuel_stop_delay_ms);
-    JSON_SET_U16(fuel_emergency_time_ms);
-    JSON_SET_U8(fuel_hyst_threshold);
-    JSON_SET_U8(fuel_hyst_cycles);
-
-    JSON_SET_FLOAT(temp_beta);
-    JSON_SET_FLOAT(temp_r_nominal);
-    JSON_SET_FLOAT(temp_min_c);
-    JSON_SET_FLOAT(temp_max_c);
-    JSON_SET_U8(temp_overheat_pct);
-    JSON_SET_U16(temp_overheat_delay_ms);
-
-    JSON_SET_U8(temp_cold_on_pct);
-    JSON_SET_U8(temp_cold_off_pct);
-    JSON_SET_U8(temp_hot_on_pct);
-    JSON_SET_U8(temp_hot_off_pct);
-    JSON_SET_U8(temp_display_hyst);
-
-    JSON_SET_FLOAT(light_ema_alpha);
-    JSON_SET_U8(brightness_min);
-    JSON_SET_U8(brightness_max);
-    JSON_SET_FLOAT(brightness_dark_lux);
-    JSON_SET_FLOAT(brightness_bright_lux);
-    JSON_SET_U8(brightness_dark_pwm);
-    JSON_SET_U8(brightness_bright_pwm);
-
-    JSON_SET_U16(blink_on_ms);
-    JSON_SET_U16(blink_off_ms);
-
-    JSON_SET_U16(pulses_per_km);
-    JSON_SET_U16(speed_max_kmh);
-    JSON_SET_U16(speed_text_interval_ms);
-    JSON_SET_U16(speed_slow_threshold);
-    JSON_SET_U16(speed_slow_interval_ms);
-    JSON_SET_U8(speed_text_hyst);
-    JSON_SET_FLOAT(speed_arc_smooth);
-    JSON_SET_U8(speed_filter_size);
-    JSON_SET_U8(speed_max_accel);
-    JSON_SET_U8(speed_confirm_count);
-
-    JSON_SET_U8(tach_enabled);
-    JSON_SET_U8(tach_pulses_per_rev);
-    JSON_SET_U16(tach_max_rpm);
-
-    JSON_SET_U32(color_normal);
-    JSON_SET_U32(color_red);
-    JSON_SET_U32(color_green);
-    JSON_SET_U32(color_yellow);
-    JSON_SET_U32(color_cold);
-    JSON_SET_U32(color_high_beam);
-    JSON_SET_U32(color_glow_plug);
-    JSON_SET_U32(color_dim);
-    JSON_SET_U32(color_disabled);
-    JSON_SET_U32(color_temp_ok);
-    JSON_SET_U32(color_fog);
-    JSON_SET_U32(color_wifi_active);
-    JSON_SET_U32(color_wifi_connected);
-    JSON_SET_U32(color_wifi_off);
-    JSON_SET_U32(color_bar_bg);
-    JSON_SET_U32(color_speedo_bg);
-    JSON_SET_U32(color_speedo_ind);
-
-    JSON_SET_U8(pin_ignition);
-    JSON_SET_U8(pin_blinker_l);
-    JSON_SET_U8(pin_blinker_r);
-    JSON_SET_U8(pin_high_beam);
-    JSON_SET_U8(pin_glow_plug);
-    JSON_SET_U8(pin_brake);
-    JSON_SET_U8(pin_oil);
-    JSON_SET_U8(pin_fog_light);
-
-    JSON_SET_U8(adc_voltage_ch);
-    JSON_SET_U8(adc_fuel_ch);
-    JSON_SET_U8(adc_temp_ch);
-
-    JSON_SET_U8(shutdown_delay_s);
-
-    {
-        cJSON *s = cJSON_GetObjectItem(j, "wifi_ssid");
-        if (s && cJSON_IsString(s)) {
-            strncpy(g_config.wifi_ssid, s->valuestring, sizeof(g_config.wifi_ssid) - 1);
-            g_config.wifi_ssid[sizeof(g_config.wifi_ssid) - 1] = '\0';
-        }
-        s = cJSON_GetObjectItem(j, "wifi_pass");
-        if (s && cJSON_IsString(s) && strlen(s->valuestring) >= 8) {
-            strncpy(g_config.wifi_pass, s->valuestring, sizeof(g_config.wifi_pass) - 1);
-            g_config.wifi_pass[sizeof(g_config.wifi_pass) - 1] = '\0';
-        }
-    }
-    JSON_SET_U8(wifi_start_delay_s);
-    JSON_SET_U8(wifi_idle_timeout_s);
-    JSON_SET_U16(wifi_active_timeout_s);
-
-    cJSON_Delete(j);
-    return true;
-}
-
-/* ======================================================================== */
 /* HTTP handlers                                                             */
 /* ======================================================================== */
 
@@ -695,7 +409,7 @@ static esp_err_t handle_root(httpd_req_t *req)
 
 static esp_err_t handle_get_config(httpd_req_t *req)
 {
-    char *json = config_to_json();
+    char *json = dashboard_config_to_json(true);
     if (!json) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON error");
         return ESP_FAIL;
@@ -708,7 +422,7 @@ static esp_err_t handle_get_config(httpd_req_t *req)
 
 static esp_err_t handle_backup(httpd_req_t *req)
 {
-    char *json = config_to_json();
+    char *json = dashboard_config_to_json(true);
     if (!json) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON error");
         return ESP_FAIL;
@@ -724,7 +438,7 @@ static esp_err_t handle_backup(httpd_req_t *req)
 static esp_err_t handle_post_config(httpd_req_t *req)
 {
     int total = req->content_len;
-    if (total <= 0 || total > 4096) {
+    if (total <= 0 || total > 8192) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad length");
         return ESP_FAIL;
     }
@@ -747,7 +461,7 @@ static esp_err_t handle_post_config(httpd_req_t *req)
     }
     buf[total] = '\0';
 
-    if (!config_from_json(buf)) {
+    if (!dashboard_config_from_json(buf, true)) {
         free(buf);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Parse error");
         return ESP_FAIL;
@@ -916,6 +630,8 @@ static void start_http_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192;
+    /* Default max_uri_handlers is 8; we need 8 + OTA (2) + captive wildcard GET (1). */
+    cfg.max_uri_handlers = 12;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
 
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
@@ -959,6 +675,9 @@ static void start_http_server(void)
     httpd_register_uri_handler(s_server, &uri_post_sim);
     httpd_register_uri_handler(s_server, &uri_sensors);
     httpd_register_uri_handler(s_server, &uri_diag);
+    if (hal_ota_register_handlers(s_server) != ESP_OK) {
+        ESP_LOGW(TAG, "OTA URI registration failed");
+    }
     httpd_register_uri_handler(s_server, &uri_captive);
 
     ESP_LOGI(TAG, "HTTP server started");
@@ -1026,7 +745,7 @@ static void wifi_task(void *arg)
     wifi_state = WIFI_STATE_ACTIVE;
 
     start_http_server();
-    xTaskCreate(dns_task_fn, "dns", 4096, NULL, 5, &dns_task_handle);
+    xTaskCreate(dns_task_fn, "dns", 4096, NULL, 2, &dns_task_handle);
 
     int idle_seconds = 0;
     bool had_client = false;
@@ -1055,5 +774,5 @@ wifi_state_t hal_wifi_get_state(void)
 
 void hal_wifi_init(void)
 {
-    xTaskCreate(wifi_task, "wifi_init", 4096, NULL, 5, NULL);
+    xTaskCreate(wifi_task, "wifi_init", 4096, NULL, 2, NULL);
 }

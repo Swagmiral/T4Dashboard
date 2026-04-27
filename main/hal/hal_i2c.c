@@ -3,6 +3,7 @@
  */
 
 #include "hal_i2c.h"
+#include "config.h"
 #include "esp_log.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
@@ -14,8 +15,6 @@ static const char *TAG = "i2c";
 #define I2C_PORT            I2C_NUM_0
 #define I2C_SDA_PIN         8   // GPIO8 = SDA
 #define I2C_SCL_PIN         9   // GPIO9 = SCL
-#define I2C_FREQ_HZ         100000
-
 // Device addresses
 #define MCP23017_ADDR       0x20  // A0=A1=A2=GND
 #define BH1750_ADDR         0x23  // ADDR pin LOW
@@ -155,7 +154,7 @@ void hal_i2c_init(void)
     i2c_device_config_t mcp_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = MCP23017_ADDR,
-        .scl_speed_hz = I2C_FREQ_HZ,
+        .scl_speed_hz = g_config.i2c_scl_hz,
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &mcp_config, &mcp23017_dev));
 
@@ -191,7 +190,7 @@ void hal_i2c_init(void)
     i2c_device_config_t bh_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = BH1750_ADDR,
-        .scl_speed_hz = I2C_FREQ_HZ,
+        .scl_speed_hz = g_config.i2c_scl_hz,
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &bh_config, &bh1750_dev));
 

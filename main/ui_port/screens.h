@@ -1,15 +1,22 @@
 #ifndef EEZ_LVGL_UI_SCREENS_H
 #define EEZ_LVGL_UI_SCREENS_H
 
-#include "lvgl.h"
+#include <lvgl/lvgl.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+// Screens
+
+enum ScreensEnum {
+    _SCREEN_ID_FIRST = 1,
+    SCREEN_ID_MAIN = 1,
+    _SCREEN_ID_LAST = 1
+};
+
 typedef struct _objects_t {
     lv_obj_t *main;
-    lv_obj_t *speedogrid;
     lv_obj_t *speedo;
     lv_obj_t *speedmask;
     lv_obj_t *speed;
@@ -61,9 +68,7 @@ typedef struct _objects_t {
     lv_obj_t *battery_icon;
     lv_obj_t *voltage;
     lv_obj_t *blinker_l;
-    lv_obj_t *blinker_l_gradient;
     lv_obj_t *blinker_r;
-    lv_obj_t *blinker_r_gradient;
     lv_obj_t *notification;
     lv_obj_t *warning;
     lv_obj_t *warning_icon;
@@ -75,10 +80,6 @@ typedef struct _objects_t {
 
 extern objects_t objects;
 
-enum ScreensEnum {
-    SCREEN_ID_MAIN = 1,
-};
-
 void create_screen_main();
 void tick_screen_main();
 
@@ -86,7 +87,6 @@ void tick_screen_by_id(enum ScreensEnum screenId);
 void tick_screen(int screen_index);
 
 void create_screens();
-
 
 #ifdef __cplusplus
 }
